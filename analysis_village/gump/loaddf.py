@@ -12,6 +12,7 @@ import pyanalib.pandas_helpers as ph
 from multiprocess import Pool
 from functools import partial
 import syst
+import rwt_map as rw
 
 import gump_cuts as gc
 
@@ -37,6 +38,7 @@ HDR = "hdr_%i"
 MC  = "mcnu_%i"
 CRT = "crt_%i"
 FLASH = "flash_%i"
+EVTREC = "evtrec_%i"
 
 pot_syst = {'ms3': 0.982714, 'ms2': 0.9887274, 'ms1': 0.99474195, 'cv': 1.0, 'ps1': 1.005, 'ps2': 1.01, 'ps3': 1.015}
 
@@ -200,6 +202,307 @@ truthvars = {
   "true_npi0": ("npi0", ""),
 }
 
+
+# ---------------------------------------------------------------------------
+# GENIE event record (evtrec) -> pre-FSI truth kinematics
+#
+# The evtrec table (makedf.makedf.make_genie_evtrec_df) is the raw GHEP particle
+# stack: one row per GENIE particle, index (__ntuple, entry, pindex), momenta and
+# energies in GeV, vtx_* in metres.
+# ---------------------------------------------------------------------------
+
+# genie::EGHepStatus codes used below
+_GHEP_INITIAL     = 0   # kIStInitialState        -- the probe and the target nucleus
+_GHEP_NUCLEON_TGT = 11  # kIStNucleonTarget       -- struck nucleon, or a 2p2h cluster
+_GHEP_PREFSI      = 14  # kIStHadronInTheNucleus  -- the hadrons that enter FSI
+
+_NEUTRON_MASS = 0.939565
+_PROTON_MASS = 0.938272
+
+# pre-FSI hadron species: output moniker -> pdg selection. Monikers follow the
+# make_mcdf convention (mu/p/p2/cpi/e). The photon is NOT here -- see below.
+_PREFSI_PDG = {
+    "p":   lambda pdg: pdg == 2212,
+    "cpi": lambda pdg: np.abs(pdg) == 211,
+    "pi0": lambda pdg: pdg == 111,
+}
+
+# Photons are a special case. They never carry status 14 -- measured on the -13
+# files, 0 of 42717 ICARUS Run2 events have one -- because a photon does not
+# rescatter and so never enters INTRANUKE; every photon in the record is status 1.
+# Their pre-FSI analogue is a photon born from a primary-vertex state, i.e. one
+# whose mother is a decayed resonance (status 3, e.g. the RDecBR1gamma radiative
+# Delta decay) or a pre-fragmentation hadronic state (status 12), or a pre-FSI
+# hadron itself. Photons whose mother is the target nucleus (status 0) are nuclear
+# de-excitation of the residual nucleus -- emitted after the interaction, not part
+# of the primary hadronic system -- and are excluded here. That cut matters: 98%
+# of the photons in the record (14388 of 14689) are de-excitation photons.
+_PREFSI_GAMMA_MOTHER = [3, 12, 14]
+
+# species carrying a momentum, in output order. "lep" is the primary lepton and
+# "p2" the sub-leading pre-FSI proton; both are handled specially below.
+_GENIE_SPECIES = ["lep", "p", "p2", "cpi", "g", "pi0"]
+
+_GENIE_SCALARS = ["genie_Enu", "genie_q0", "genie_q3", "genie_W",
+                  "genie_pmiss", "genie_emiss"]
+
+GENIE_COLS = _GENIE_SCALARS + ["genie_prefsi_%s_p%s" % (s, c)
+                               for s in _GENIE_SPECIES for c in "xyz"]
+
+def _p3(d):
+    """(N,3) momentum array from a frame with px/py/pz columns."""
+    return np.c_[d.px.to_numpy(float), d.py.to_numpy(float), d.pz.to_numpy(float)]
+
+def _evtrec_link(mcdf):
+    """Index of each mcnu row's entry in the GENIE event record.
+
+    Prefer the stored link (rec.mc.nu.genie_evtrec_idx) where the production kept
+    it -- maple does, gump's make_gump_nudf does not. Otherwise reconstruct it: the
+    GenieEvtRecTree entry number is a running counter over the neutrinos of the
+    input file, so it is the position of the mcnu row within its __ntuple.
+
+    That reconstruction is verified against the interaction vertex by
+    _evtrec_kinematics; on the -13 files it resolves every evtrec entry to exactly
+    one mcnu row, with the vertex and Enu agreeing exactly. NB the *recTree* entry
+    is NOT the evtrec entry -- assuming it is picks the wrong neutrino for 14% of
+    ICARUS and 90% of SBND records, because a record holding two neutrinos advances
+    the GENIE counter by two while advancing the recTree entry by one.
+    """
+    flat = [c[0] if isinstance(c, tuple) else c for c in mcdf.columns]
+    if "genie_evtrec_idx" in flat:
+        return mcdf[mcdf.columns[flat.index("genie_evtrec_idx")]]
+    srt = mcdf.sort_index()
+    return pd.Series(srt.groupby(level=0).cumcount().to_numpy(),
+                     index=srt.index).reindex(mcdf.index)
+
+def _evtrec_kinematics(er, mcdf):
+    """Pre-FSI GENIE truth kinematics, indexed like `mcdf` so it can be joined onto
+    the slice frame through tmatch_idx.
+
+    All momenta are given in an event-by-event frame built from the record itself:
+
+        z_hat = p_nu / |p_nu|                (the initial-state neutrino direction)
+        y_hat = the outgoing lepton's momentum transverse to z_hat, normalised
+        x_hat = y_hat x z_hat
+
+    so the neutrino is (0, 0, Enu) and the primary lepton is (0, +pT, pL) -- the
+    lepton px is identically zero and its py is positive by construction, and x is
+    the out-of-plane direction.
+
+    Returns (frame, stats) where stats carries the diagnostics load_one prints.
+    """
+    nan = pd.DataFrame(np.nan, index=mcdf.index, columns=GENIE_COLS)
+    stats = {"n_mcnu": len(mcdf), "n_resolved": 0, "vtx_ok": np.nan}
+    if er is None or not len(er) or not len(mcdf):
+        return nan, stats
+
+    # --- per-GENIE-event pieces, all indexed by (__ntuple, evtrec entry) ---------
+    # The probe sits at pindex 0 and its (single) daughter is the primary lepton.
+    probe = er[er.index.get_level_values("pindex") == 0].droplevel("pindex")
+    probe = probe[probe.status == _GHEP_INITIAL]
+
+    lidx = pd.MultiIndex.from_arrays(
+        [probe.index.get_level_values(0), probe.index.get_level_values(1),
+         probe.fdaughter.to_numpy()], names=er.index.names)
+    lep = er.reindex(lidx)
+    lep.index = probe.index
+
+    tgt = er[er.status == _GHEP_NUCLEON_TGT].groupby(level=[0, 1]).first().reindex(probe.index)
+
+    # --- rotation basis ---------------------------------------------------------
+    pnu, plep = _p3(probe), _p3(lep)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        zh = pnu / np.linalg.norm(pnu, axis=1, keepdims=True)
+        pt = plep - np.sum(plep*zh, axis=1, keepdims=True)*zh
+        yh = pt / np.linalg.norm(pt, axis=1, keepdims=True)
+    xh = np.cross(yh, zh)
+
+    def rot(d):
+        """Project a species' momentum onto (x_hat, y_hat, z_hat)."""
+        v = _p3(d.reindex(probe.index))
+        return np.c_[np.sum(v*xh, 1), np.sum(v*yh, 1), np.sum(v*zh, 1)]
+
+    # --- scalars ----------------------------------------------------------------
+    Enu = probe.E.to_numpy(float)
+    q0 = Enu - lep.E.to_numpy(float)
+    q3 = np.linalg.norm(pnu - plep, axis=1)
+    Q2 = q3**2 - q0**2
+
+    # W in GENIE's own convention: an on-shell nucleon at rest, so this is directly
+    # comparable to rec.mc.nu.w. The target pdg is a di-nucleon cluster (2000000200
+    # /201/202/300) for 2p2h, where the neutron/proton average is the best available
+    # nucleon mass.
+    tpdg = tgt.pdg.to_numpy(float)
+    is_nucleon = np.isin(tpdg, [2212, 2112])
+    M = np.where(tpdg == 2212, _PROTON_MASS,
+                 np.where(tpdg == 2112, _NEUTRON_MASS, 0.5*(_PROTON_MASS + _NEUTRON_MASS)))
+    W2 = M**2 + 2*M*q0 - Q2
+    W = np.sqrt(np.where(W2 > 0, W2, np.nan))
+
+    # Fermi momentum and removal energy of the struck nucleon -- the quantities the
+    # LFG/SF/HF CCQE template dials move. Undefined for a 2p2h cluster target, so
+    # those events are left NaN rather than quietly mixing in a cluster momentum.
+    ptgt = np.linalg.norm(_p3(tgt), axis=1)
+    pmiss = np.where(is_nucleon, ptgt, np.nan)
+    emiss = np.where(is_nucleon, M - tgt.E.to_numpy(float), np.nan)
+
+    out = pd.DataFrame({"genie_Enu": Enu, "genie_q0": q0, "genie_q3": q3,
+                        "genie_W": W, "genie_pmiss": pmiss, "genie_emiss": emiss},
+                       index=probe.index)
+
+    # --- pre-FSI species, leading by |p| ----------------------------------------
+    pre = er[er.status == _GHEP_PREFSI]
+    pre = pre.assign(_pmag=np.linalg.norm(_p3(pre), axis=1)).sort_values("_pmag", ascending=False)
+
+    parts = {"lep": lep}
+    for name, sel in _PREFSI_PDG.items():
+        s = pre[sel(pre.pdg.to_numpy())]
+        parts[name] = s.groupby(level=[0, 1]).head(1).droplevel("pindex")
+    # sub-leading proton: second row of the momentum-ordered proton list
+    sp = pre[pre.pdg == 2212]
+    sp = sp.groupby(level=[0, 1]).head(2)
+    parts["p2"] = sp[sp.groupby(level=[0, 1]).cumcount() == 1].droplevel("pindex")
+
+    # photons: status-1, but only those from a primary-vertex parent (see above)
+    gam = er[er.pdg == 22]
+    if len(gam):
+        gmom = er.reindex(pd.MultiIndex.from_arrays(
+            [gam.index.get_level_values(0), gam.index.get_level_values(1),
+             gam.fmother.to_numpy()], names=er.index.names))
+        gam = gam[np.isin(gmom.status.to_numpy(float), _PREFSI_GAMMA_MOTHER)]
+        gam = gam.assign(_pmag=np.linalg.norm(_p3(gam), axis=1)).sort_values("_pmag", ascending=False)
+    parts["g"] = gam.groupby(level=[0, 1]).head(1).droplevel("pindex")
+
+    for name in _GENIE_SPECIES:
+        v = rot(parts[name])
+        for i, c in enumerate("xyz"):
+            out["genie_prefsi_%s_p%s" % (name, c)] = v[:, i]
+
+    # --- map onto the mcnu index via the evtrec link ----------------------------
+    link = _evtrec_link(mcdf).to_numpy(float)
+    link = np.where(np.isfinite(link), link, -1).astype(np.int64)
+    gidx = pd.MultiIndex.from_arrays([mcdf.index.get_level_values(0), link],
+                                     names=out.index.names)
+    res = out.reindex(gidx)
+    res.index = mcdf.index
+
+    # --- self-check: the link is reconstructed, so verify it against the vertex --
+    # evtrec vtx_* is in metres, mcnu pos_* in cm. Both name the same interaction
+    # point, so on a correct link they agree to round-off on every resolved row.
+    vtx = probe[["vtx_x", "vtx_y", "vtx_z"]].reindex(gidx)
+    got = np.isfinite(vtx.vtx_x.to_numpy(float))
+    stats["n_resolved"] = int(got.sum())
+    if got.any():
+        pos = np.c_[mcdf.pos_x.to_numpy(float), mcdf.pos_y.to_numpy(float),
+                    mcdf.pos_z.to_numpy(float)]
+        d = np.abs(vtx.to_numpy(float)*100. - pos).max(axis=1)
+        stats["vtx_ok"] = float((d[got] < 1e-3).mean())
+
+    return res, stats
+
+detvar_rwt_files = [
+  'SBND_WMXThetaXW.txt',
+  'SBND_WMYZ.txt',
+  'SBND_DENT.txt',
+  ['SBND_0xSCE.txt', 'SBND_2xSCE.txt'],
+  'ICARUSRun2_SCE.txt',
+  'ICARUSRun4_SCE.txt',
+  'SBND_SmeareddEdx.txt',
+  'ICARUSRun2_SmeareddEdx.txt',
+  'ICARUSRun2_WMXThetaXW.txt',
+  'ICARUSRun4_SmeareddEdx.txt',
+  'ICARUSRun4_WMXThetaXW.txt',
+  'SBND_GainHi.txt',
+  'ICARUSRun2_GainHi.txt',
+  'ICARUSRun4_GainHi.txt',
+  'SBND_EMBAlpha.txt',
+  'ICARUSRun2_EMBAlpha.txt',
+  'ICARUSRun4_EMBAlpha.txt',
+  'SBND_EMBBeta.txt',
+  'ICARUSRun2_EMBBeta.txt',
+  'ICARUSRun4_EMBBeta.txt',
+  'SBND_EMBR.txt',
+  'ICARUSRun2_EMBR.txt',
+  'ICARUSRun4_EMBR.txt',
+  ['SBND_TrigEffMin.txt', 'SBND_TrigEffPls.txt'],
+  ['ICARUSRun2_TrigEffMin.txt', 'ICARUSRun2_TrigEffPls.txt'],
+  ['ICARUSRun4_TrigEffMin.txt', 'ICARUSRun4_TrigEffPls.txt'],
+  'SBND_BIND.txt',
+  'ICARUSRun2_BIND.txt',
+  'ICARUSRun4_BIND.txt',
+  'ICARUSRun2_Z=0_TRKSPLT.txt',
+  'ICARUSRun4_Z=0_TRKSPLT.txt',
+  'ICARUSRun2_EastCathode_TRKSPLT.txt',
+  'ICARUSRun4_EastCathode_TRKSPLT.txt',
+  'ICARUSRun2_WestCathode_TRKSPLT.txt',
+  'ICARUSRun4_WestCathode_TRKSPLT.txt',
+]
+
+detvar_rwt_lbls = [
+  'WireMod_SBND_multisigma_WMXThetaXW',
+  'WireMod_SBND_multisigma_WMYZ',
+  'DENT_SBND_multisigma_DENT',
+  'SCE_SBND_multisigma_SCE',
+  'SCE_ICARUSRun2_multisigma_SCE',
+  'SCE_ICARUSRun4_multisigma_SCE',
+  'SBND_PID_Smear',
+  'ICARUSRun2_PID_Smear',
+  'WireMod_ICARUSRun2_multisigma_WMXThetaXW',
+  'ICARUSRun4_PID_Smear',
+  'WireMod_ICARUSRun4_multisigma_WMXThetaXW',
+  'SBND_PID_Gain',
+  'ICARUSRun2_PID_Gain',
+  'ICARUSRun4_PID_Gain',
+  'SBND_PID_Alpha',
+  'ICARUSRun2_PID_Alpha',
+  'ICARUSRun4_PID_Alpha',
+  'SBND_PID_Beta',
+  'ICARUSRun2_PID_Beta',
+  'ICARUSRun4_PID_Beta',
+  'SBND_PID_R',
+  'ICARUSRun2_PID_R',
+  'ICARUSRun4_PID_R',
+  'SBND_TrigEff',
+  'ICARUSRun2_TrigEff',
+  'ICARUSRun4_TrigEff',
+  'BIND',
+  'BIND',
+  'BIND',
+  'ICARUSRun2_Z=0_TRKSPLT',
+  'ICARUSRun4_Z=0_TRKSPLT',
+  'ICARUSRun2_EastCathode_TRKSPLT',
+  'ICARUSRun4_EastCathode_TRKSPLT',
+  'ICARUSRun2_WestCathode_TRKSPLT',
+  'ICARUSRun4_WestCathode_TRKSPLT',
+]
+
+std_drops = ['is_clear_cosmic', 'crlongtrkdiry', 'p_len', 'has_stub',
+             'true_pcand_pdg', 'true_p_dir_x', 'true_p_dir_y', 'true_p_dir_z', 
+             'true_pcand_dir_x', 'true_pcand_dir_y', 'true_pcand_dir_z', 
+             'true_pcand_end_x', 'true_pcand_end_y', 'true_pcand_end_z',
+             'true_mucand_pdg', 'true_mucand_dir_x', 'true_mucand_dir_y', 
+             'true_mucand_dir_z', 'true_mucand_end_x', 'true_mucand_end_y', 
+             'true_mucand_end_z', 'stub_l0_5cm_dedx','stub_l0_5cm_charge',
+             'stub_l1cm_dedx','stub_l1cm_charge','stub_l2cm_dedx',
+             'stub_l2cm_charge','stub_l3cm_dedx','stub_l3cm_charge',
+             'stub_l4cm_dedx','stub_l4cm_charge','prot_chi2smear5_of_prot_cand', 
+             'prot_chi2smear5_of_mu_cand', 'mu_chi2smear5_of_mu_cand', 
+             'mu_chi2smear5_of_prot_cand', 'tmatch_pur', 'tmatch_eff', 
+             'true_baseline', 'true_nu_pdg_x', 'true_nu_pdg_y',
+             'true_nmu_27MeV', 'true_np_20MeV', 'true_np_50MeV', 
+             'true_npi_30MeV', 'is_cosmic', 'flash_sumpe', 'true_mucand_p', 
+             'true_pcand_p', 'p_true_p', 'true_mu_end_x', 
+             'true_p_end_x', 'true_mu_end_y', 'true_p_end_y', 'true_mu_end_z', 
+             'true_p_end_z','crthit', 'true_nu_E', 'p_true_pdg', 'mu_true_pdg', 
+             'mu_chi22lo_of_mu_cand', 'mu_chi22hi_of_mu_cand', 
+             'prot_chi22lo_of_mu_cand', 'prot_chi22hi_of_mu_cand',
+             'mu_chi22lo_of_prot_cand', 'mu_chi22hi_of_prot_cand', 
+             'prot_chi22lo_of_prot_cand', 'prot_chi22hi_of_prot_cand', 
+             'true_mu_p', 'true_p_p', 'pot_univ']
+
+def get_std_drops():
+    return std_drops
+
 def scale_pot(df, pot, desired_pot):
     """Scale DataFrame by desired POT."""
     scale = desired_pot / pot
@@ -348,32 +651,30 @@ def _apply_variations(df, shift_binding_E, split_tracks,
         df = syst.shift_binding_energy(df, BE_SHIFT, fraction=f, scale=_weight_col(df))
     return df
 
-#@profile
 def load_one(fname, idf,
     detector=None, # One of SBND, ICARUS, ICARUS Run4
     include_syst=True, nuniv=100, spline=False, xsec_univ=False, xsec_spline=False,# systematic handling
-    reweight_aFF=False, pot_univ=False, flux_univ=True, sep_flux_univ=False, g4_univ=True,
+    reweight_aFF=False, pot_univ=False, flux_univ=True, sep_flux_univ=False, g4_univ=True, sep_g4_univ=False,
     pot_spline=False, detvar_spline=False, spline_dir="rwt_outputs",
-    load_truth=True, load_crt=False, match_Enu=True, # load extra information
+    load_truth=True, load_crt=False, load_evtrec=False, match_Enu=True, # load extra information
     offbeampot=False, # POT handling
     preselection=None, # apply preselection cut
     shift_binding_E=False, split_tracks=None, # variations applied to the output df (see _apply_variations)
     shift_fraction=None, split_fraction=None, # fraction of events each variation is applied to (None -> BE_FRACTION / SPLIT_FRAC)
     cache_dir=None, # directory to cache output; None disables caching
-    flashname=FLASH, hdrname=HDR, evtname=EVT, wgtname=WGT, mcname=MC, crtname=CRT, drops=None, lightmem=False): # override default table names
+    flashname=FLASH, hdrname=HDR, evtname=EVT, wgtname=WGT, mcname=MC, crtname=CRT, evtrecname=EVTREC, drops=None, lightmem=False): # override default table names
 
     assert(detector == "SBND" or detector == "ICARUS Run2" or detector == "ICARUS Run4")
-
     # Check cache
     if cache_dir is not None:
         cache_hash = _cache_key(fname, idf, detector=detector, include_syst=include_syst,
             nuniv=nuniv, spline=spline, xsec_univ=xsec_univ, xsec_spline=xsec_spline, reweight_aFF=reweight_aFF, pot_univ=pot_univ,
             flux_univ=flux_univ, sep_flux_univ=sep_flux_univ, g4_univ=g4_univ,
-            load_truth=load_truth, load_crt=load_crt,
+            load_truth=load_truth, load_crt=load_crt, load_evtrec=load_evtrec,
             match_Enu=match_Enu, offbeampot=offbeampot, preselection=preselection,
             drops=drops, lightmem=lightmem,
             flashname=flashname, hdrname=hdrname, evtname=evtname,
-            wgtname=wgtname, mcname=mcname, crtname=crtname)
+            wgtname=wgtname, mcname=mcname, crtname=crtname, evtrecname=evtrecname)
         cache_file = os.path.join(cache_dir, cache_hash + ".h5")
         if os.path.exists(cache_file):
             try:
@@ -389,18 +690,6 @@ def load_one(fname, idf,
     df =  pd.read_hdf(fname, evtname % idf)
     hdr = pd.read_hdf(fname, hdrname % idf)
     ismc = hdr.ismc.iloc[0] == 1
-
-    # set run 
-    if "SBND" in fname:
-        df["Run"] = 1
-        Run = 1
-    elif "ICARUS" in fname and "Run4" in fname:
-        df["Run"] = 4
-        Run = 4
-    elif "ICARUS" in fname:
-        df["Run"] = 2
-        Run = 2
-    else: assert(False)
 
     # apply the scaled pe flash
     if ismc: # Scale PE for MC-only
@@ -435,8 +724,8 @@ def load_one(fname, idf,
 
         # Add in other meta-data to match.
         vtx = pd.DataFrame({
-          "detector": detector,
-          "Run": Run,
+          "detector": mcdf.detector,
+          "Run": mcdf.Run,
           "x": mcdf.pos_x,
           "y": mcdf.pos_y,
           "z": mcdf.pos_z,
@@ -503,7 +792,40 @@ def load_one(fname, idf,
         for setv, load in truthvars.items():
             mc_tosave[setv] = mcdf[load]
         mcdf = pd.DataFrame(mc_tosave, mcdf.index)
-        df = df.merge(mcdf, left_on=["__ntuple", "entry", "tmatch_idx"], right_index=True, how="left") 
+        df = df.merge(mcdf, left_on=["__ntuple", "entry", "tmatch_idx"], right_index=True, how="left")
+
+    # LOAD GENIE EVENT RECORD
+    # Pre-FSI truth kinematics from the raw GHEP stack, joined on tmatch_idx exactly
+    # like the truth block above: tmatch_idx names the mcnu row, and _evtrec_kinematics
+    # returns its columns on the mcnu index. Slices with no truth match (cosmics) fall
+    # out of the left join as NaN, as they already do for truthvars.
+    if load_evtrec:
+        with h5py.File(fname, "r") as f:
+            has_evtrec = (evtrecname % idf) in f
+        if has_evtrec:
+            er = pd.read_hdf(fname, evtrecname % idf)
+            mcdf = pd.read_hdf(fname, mcname % idf)
+            gdf, gstats = _evtrec_kinematics(er, mcdf)
+            del er
+            # The evtrec link is reconstructed, not stored (see _evtrec_link), so say
+            # out loud how much of the sample it reached and shout if the vertex
+            # cross-check fails -- a broken link would silently attach another
+            # neutrino's kinematics rather than raise.
+            frac = gstats["n_resolved"] / max(gstats["n_mcnu"], 1)
+            print(f"[{os.path.basename(fname)} idf={idf}] evtrec: "
+                  f"{gstats['n_resolved']}/{gstats['n_mcnu']} neutrinos resolved "
+                  f"({100*frac:.1f}%), vertex check {gstats['vtx_ok']:.5f}")
+            if gstats["n_resolved"] > 0 and not (gstats["vtx_ok"] > 0.999):
+                print(f"WARNING: {os.path.basename(fname)} idf={idf}: the GENIE event "
+                      f"record link does not reproduce the mcnu vertex "
+                      f"({gstats['vtx_ok']:.5f} agree) -- genie_* columns are NOT "
+                      f"trustworthy for this file.")
+        else:
+            # No evtrec in this file (data, detvar, dirt, ...). Emit the columns as NaN
+            # so a mixed file list still concatenates to one schema.
+            gdf = pd.DataFrame(np.nan, index=pd.read_hdf(fname, mcname % idf).index,
+                               columns=GENIE_COLS)
+        df = df.merge(gdf, left_on=["__ntuple", "entry", "tmatch_idx"], right_index=True, how="left")
 
     # LOAD CRT
     if load_crt:
@@ -515,6 +837,10 @@ def load_one(fname, idf,
         df = df.join(crthit, on=["__ntuple", "entry"])
 
     df["crthit"] = df.crthit.fillna(False).astype(bool) 
+
+    # LOAD WEIGHTS
+    if include_syst:
+        wgt = pd.read_hdf(fname, wgtname % idf) 
 
     # LOAD AXIAL FORM FACTOR REWEIGHT
     if reweight_aFF:
@@ -555,9 +881,21 @@ def load_one(fname, idf,
     # LOAD WEIGHTS
     wgt = pd.read_hdf(fname, wgtname % idf) 
     skim = {}
+
     if flux_univ:
-        for i in range(min(100, nuniv)):
-            skim["flux_univ%i" % i] = np.prod([wgt[s]["univ_%i" % i] for s in flux_syst], axis=0)
+        num_to_process = min(100, nuniv)
+        
+        # Pre-cache the system lookups to avoid doing it inside the inner loops
+        system_data = [wgt[s] for s in flux_syst]
+        
+        new_columns_dict = {}
+        for i in range(num_to_process):
+            univ_key = "univ_%i" % i
+            # np.prod over the pre-cached systems list
+            new_columns_dict["flux_univ%i" % i] = np.prod([sys[univ_key] for sys in system_data], axis=0)
+            
+        # --- FIX HERE: Merging two dictionaries ---
+        skim.update(new_columns_dict)
 
     if g4_univ:
         for i in range(min(100, nuniv)):
@@ -593,17 +931,42 @@ def load_one(fname, idf,
     multisim_cols = []
     multisigma_cols = []
 
+    if pot_spline:
+        for d in ["SBND", "ICARUS Run2", "ICARUS Run4"]:
+            col_str = f"multisigma_{d.replace(' ', '')}_POT"
+            multisigma_cols.append(col_str)
+            if det == d:
+                skim[f"{col_str}"] = [list(pot_syst.values()) for _ in range(len(wgt))]
+            else:
+                skim[f"{col_str}"] = [[1.0]*7 for _ in range(len(wgt))]
+
     if sep_flux_univ:
         for j, s in enumerate(flux_syst):
-            multisim_cols.append(s)
-            w = wgt[s]#.fillna(1).replace([np.inf, -np.inf], 1)
+            if not 'multisim' in s:
+                col_str = 'multisim_'+s
+            else:
+                col_str = s
+            multisim_cols.append(col_str)
+            w = wgt[s]
             if lightmem:
-                w[w.select_dtypes(include=["float64"]).columns] = w.select_dtypes(include=["float64"]).astype("float32")
+                float64_cols = w.select_dtypes(include=["float64"]).columns
+                w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
             stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
-            skim[s] = stacked_variants.T.tolist()
-            for d in stacked_variants.T.tolist():
-                if len(d) != 100:
-                    print(d)
+            skim[col_str] = stacked_variants.T.tolist()
+
+    if sep_g4_univ:
+        for j, s in enumerate(g4_syst):
+            if not 'multisim' in s:
+                col_str = 'multisim_'+s
+            else:
+                col_str = s
+            multisim_cols.append(col_str)
+            w = wgt[s]
+            if lightmem:
+                float64_cols = w.select_dtypes(include=["float64"]).columns
+                w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
+            stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
+            skim[col_str] = stacked_variants.T.tolist()
 
     if xsec_univ:
         rng = np.random.default_rng(seed=24601) # repeatable random numbers
@@ -633,7 +996,6 @@ def load_one(fname, idf,
 
     if xsec_spline:
         for j, s in enumerate(xsec_syst):
-            multisigma_cols.append(s)
             if "ps1" in wgt[s]:
                 w = wgt[s].fillna(1).replace([np.inf, -np.inf], 1)
                 stacked_variants = np.vstack([
@@ -645,23 +1007,40 @@ def load_one(fname, idf,
                     np.clip((w["ps2"] / w["cv"]).to_numpy(), 0, 10),
                     np.clip((w["ps3"] / w["cv"]).to_numpy(), 0, 10)
                 ])
-
-                # 2. Transpose to shape (n_events, 7) so each row represents an event,
-                # then convert to a list of lists for uproot/awkward ingestion later
-                skim[s] = stacked_variants.T.tolist()
+                if not 'multisigma' in s:
+                    col_str = 'multisigma_'+s
+                else:
+                    col_str = s
+                skim[col_str] = stacked_variants.T.tolist()
+                multisigma_cols.append(col_str)
             elif "morph" in wgt[s]:
                 w = wgt[s].fillna(1).replace([np.inf, -np.inf], 1)
                 if lightmem:
-                    w[w.select_dtypes(include=["float64"]).columns] = w.select_dtypes(include=["float64"]).astype("float32")
+                    float64_cols = w.select_dtypes(include=["float64"]).columns
+                    w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
 
                 stacked_variants = np.vstack([
                     np.ones(len(w)),  # Central value ratio is exactly 1.0
                     np.clip((w["morph"]).to_numpy(), 0, 10)
                 ])
-
-                # 2. Transpose to shape (n_events, 7) so each row represents an event,
-                # then convert to a list of lists for uproot/awkward ingestion later
+                if not 'multisigma' in s:
+                    col_str = 'multisigma_'+s
+                else:
+                    col_str = s
+                skim[col_str] = stacked_variants.T.tolist()
+                multisigma_cols.append(col_str)
+            elif "multisim" in s:
+                w = wgt[s]#.fillna(1).replace([np.inf, -np.inf], 1)
+                if lightmem:
+                    float64_cols = w.select_dtypes(include=["float64"]).columns
+                    w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
+                stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
                 skim[s] = stacked_variants.T.tolist()
+                if not 'multisim' in s:
+                    col_str = 'multisim_'+s
+                else:
+                    col_str = s
+                multisim_cols.append(s)
 
     else:
         for i, s in enumerate(xsec_syst):
@@ -676,22 +1055,66 @@ def load_one(fname, idf,
 
     skim = pd.DataFrame(skim, index=wgt.index)
 
-
     mrg = df.merge(skim,
             left_on=["__ntuple", "entry", "tmatch_idx"],
             right_index=True,
             how="left") ## -- save all sllices
 
+    if detvar_spline:
+        for s, f in zip(detvar_rwt_lbls, detvar_rwt_files):
+            if isinstance(f, (str, bytes)):
+                fs = [spline_dir + '/' + f]
+            else:
+                fs = [spline_dir + '/' + fi for fi in f]
+            
+            allowed_substrings = ["ICARUSRun4", "ICARUSRun2", "SBND"]
+
+            if not all(any(sub in s for sub in allowed_substrings) for s in fs):
+                # Find the specific offender to make the error message helpful
+                invalid_string = next(s for s in fs if not any(sub in s for sub in allowed_substrings))
+                raise ValueError(f"Validation failed: '{invalid_string}' is invalid. Check that your reweight files are all for the same detector.")
+
+            if not 'multisigma' in s:
+                col_str = 'multisigma_' + s
+            else:
+                col_str = s
+
+            # allow for f 
+            if det.replace(' ', '') in fs[0]:
+                s_df = rw.apply_map(mrg, fs, s)
+                mrg[col_str] = s_df
+            elif not col_str in mrg.columns:
+            # Don't overwrite existing columns with defaults (eg BIND)
+                mrg[col_str] = [[1.0]*(len(fs)+1) for _ in range(len(mrg))]
+
+            multisigma_cols.append(col_str)
+
     univ_cols = [col for col in skim.columns if "univ" in col]
     if len(multisigma_cols) > 0:
         nan_mask = mrg[multisigma_cols[0]].isna()
+        n_missing = nan_mask.sum()
         for col in multisigma_cols:
-            mrg.loc[nan_mask, col] = mrg.loc[nan_mask, col].apply(lambda x: [1.0] * len(mrg.loc[~nan_mask, col].iloc[0]))
+            valid_rows = mrg.loc[~nan_mask, col]
+            if len(valid_rows) > 0:
+                col_len = len(valid_rows.iloc[0])
+            else:
+                col_len = 7  # Fallback to standard 7-knot default if the whole block is NaN
+            
+            # 2. Vectorized assignment: Create the block of lists all at once
+            default_val = [1.0] * col_len
+            mrg.loc[nan_mask, col] = pd.Series([default_val] * n_missing, index=mrg.index[nan_mask])
 
     if len(multisim_cols) > 0:
-        nan_mask = mrg[multisim_cols[0]].isna()
+
         for col in multisim_cols:
-            mrg.loc[nan_mask, col] = mrg.loc[nan_mask, col].apply(lambda x: [1.0] * 100)
+            nan_mask = mrg[col].isna()
+            n_missing = nan_mask.sum()
+            valid_rows = mrg.loc[~nan_mask, col]
+            col_len = 100#len(mrg[col].iloc[0]) 
+
+            # 2. Vectorized assignment: Create the block of lists all at once
+            default_val = [1.0] * col_len
+            mrg.loc[nan_mask, col] = pd.Series([default_val] * n_missing, index=mrg.index[nan_mask])
 
     if len(univ_cols) > 0:
         mrg.loc[np.isnan(mrg[univ_cols[0]]), univ_cols] = 1.0 
@@ -849,5 +1272,3 @@ class XSecSystematic(syst.WeightSystematic):
 class POTSystematic(syst.WeightSystematic):
     def __init__(self, df, scale="glob_scale"):
         super().__init__(df, ["pot_univ"], avg=False, scale=scale)
-
-

@@ -14,3 +14,7 @@ analysis_village/maple/file-lists/
 *~
 envs/venv_py310_cafpyana/
 envs/logs/
+*.ipynb_checkpoints/*
+*__init__.py
+*jupyterhub.sqlite
+jupyterhub_cookie_secret
