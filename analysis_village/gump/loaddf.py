@@ -185,12 +185,12 @@ g4_syst = [
 ]
 
 truthvars = {
+  "baseline": ("baseline", ""),
   "true_E": ("nu_E", ""),
   "true_nu_pdg": ("pdg", ""),
   "true_issig": ("is_sig", ""),
   "true_isothernumucc": ("is_other_numucc", ""),
   "true_isfv": ("is_fv", ""),
-  "true_isnc": ("is_nc", ""),
   "genie_mode": ("genie_mode", ""),
   "true_vtx_x": ("pos_x", ""),
   "true_vtx_y": ("pos_y", ""),
@@ -219,6 +219,31 @@ _GHEP_PREFSI      = 14  # kIStHadronInTheNucleus  -- the hadrons that enter FSI
 _NEUTRON_MASS = 0.939565
 _PROTON_MASS = 0.938272
 
+# INTRANUKE fate of a hadron that went through FSI, from the GHEP rescatter code.
+# Surfaced per species as genie_prefsi_<species>_fsi, alongside the GHEP status code as
+# genie_prefsi_<species>_status. Only status-14 particles carry a fate, so leptons and
+# photons are always FSI_NONE. FSI_NOINT means the cascade ran and left the hadron
+# alone: "FSI was applied" is `fsi >= FSI_NOINT`, "FSI changed the particle" is
+# `fsi > FSI_NOINT`. NB there is no separate absorption fate -- a pion absorbed on the
+# nucleus is FSI_INELAS with no pion among its daughters.
+FSI_NONE   = -1  # no FSI applied: leptons, photons, and the hadrons INTRANUKE does not
+                 # transport (eta, Lambda, rho, K0, Sigma+, ...)
+FSI_NOINT  = 1   # cascade ran, hadron did not interact
+FSI_CEX    = 2   # charge exchange, e.g. pi+ n -> pi0 p
+FSI_ELAS   = 3   # elastic: identity kept, one nucleon knocked out
+FSI_INELAS = 4   # inelastic, including pion absorption
+FSI_PIPROD = 7   # pion production
+
+# Only the codes above occur in the GUMP productions; anything else decodes to "codeN".
+GENIE_FSI_NAMES = {FSI_NONE: "none", FSI_NOINT: "noint", FSI_CEX: "cex",
+                   FSI_ELAS: "elas", FSI_INELAS: "inelas", FSI_PIPROD: "piprod"}
+
+def genie_fsi_name(code):
+    """Name of an FSI fate code, for labelling cuts and plots."""
+    if code is None or (isinstance(code, float) and np.isnan(code)):
+        return "nan"
+    return GENIE_FSI_NAMES.get(int(code), "code%d" % int(code))
+
 # pre-FSI hadron species: output moniker -> pdg selection. Monikers follow the
 # make_mcdf convention (mu/p/p2/cpi/e). The photon is NOT here -- see below.
 _PREFSI_PDG = {
@@ -246,8 +271,11 @@ _GENIE_SPECIES = ["lep", "p", "p2", "cpi", "g", "pi0"]
 _GENIE_SCALARS = ["genie_Enu", "genie_q0", "genie_q3", "genie_W",
                   "genie_pmiss", "genie_emiss"]
 
-GENIE_COLS = _GENIE_SCALARS + ["genie_prefsi_%s_p%s" % (s, c)
-                               for s in _GENIE_SPECIES for c in "xyz"]
+# per species: the rotated momentum, the GHEP status code, and the FSI fate code
+_GENIE_PER_SPECIES = ["px", "py", "pz", "status", "fsi"]
+
+GENIE_COLS = _GENIE_SCALARS + ["genie_prefsi_%s_%s" % (s, q)
+                               for s in _GENIE_SPECIES for q in _GENIE_PER_SPECIES]
 
 def _p3(d):
     """(N,3) momentum array from a frame with px/py/pz columns."""
@@ -292,7 +320,7 @@ def _evtrec_kinematics(er, mcdf):
     Returns (frame, stats) where stats carries the diagnostics load_one prints.
     """
     nan = pd.DataFrame(np.nan, index=mcdf.index, columns=GENIE_COLS)
-    stats = {"n_mcnu": len(mcdf), "n_resolved": 0, "vtx_ok": np.nan}
+    stats = {"n_mcnu": len(mcdf), "n_resolved": 0, "vtx_ok": np.nan, "n_degen": 0}
     if er is None or not len(er) or not len(mcdf):
         return nan, stats
 
@@ -315,6 +343,22 @@ def _evtrec_kinematics(er, mcdf):
         zh = pnu / np.linalg.norm(pnu, axis=1, keepdims=True)
         pt = plep - np.sum(plep*zh, axis=1, keepdims=True)*zh
         yh = pt / np.linalg.norm(pt, axis=1, keepdims=True)
+
+    # A lepton collinear with the neutrino defines no transverse direction: |pt| is then
+    # pure round-off and pt/|pt| is noise, giving a non-orthonormal frame and inflated
+    # momenta. The azimuth is arbitrary for such an event, so fix it by convention --
+    # detector y, made transverse to the neutrino -- which keeps the frame orthonormal,
+    # so magnitudes and relative angles stay right and the lepton lands at (0, ~0, |p|).
+    # Safe because the beam is far from detector y (|z_hat.y_det| < 0.01). The threshold
+    # is uncritical: affected events sit at |pt|/|p| <= 4e-16, the next one up at 7e-4.
+    # `~( > )` also catches the exactly-collinear rows, where yh is already NaN.
+    degen = ~(np.linalg.norm(pt, axis=1) > 1e-9*np.linalg.norm(plep, axis=1))
+    if degen.any():
+        yfb = np.zeros_like(zh)
+        yfb[:, 1] = 1.
+        yfb -= np.sum(yfb*zh, axis=1, keepdims=True)*zh
+        yfb /= np.linalg.norm(yfb, axis=1, keepdims=True)
+        yh = np.where(degen[:, None], yfb, yh)
     xh = np.cross(yh, zh)
 
     def rot(d):
@@ -374,9 +418,17 @@ def _evtrec_kinematics(er, mcdf):
     parts["g"] = gam.groupby(level=[0, 1]).head(1).droplevel("pindex")
 
     for name in _GENIE_SPECIES:
-        v = rot(parts[name])
+        d = parts[name].reindex(probe.index)
+        v = rot(d)
         for i, c in enumerate("xyz"):
             out["genie_prefsi_%s_p%s" % (name, c)] = v[:, i]
+        # status is 14 for the pre-FSI hadrons and 1 for the lepton and photon, so it
+        # says which species saw FSI at all without knowing how each was selected.
+        out["genie_prefsi_%s_status" % name] = d.status.to_numpy(float)
+        out["genie_prefsi_%s_fsi" % name] = d.rescat.to_numpy(float)
+
+    # events whose azimuth came from the detector-y fallback rather than the lepton
+    stats["n_degen"] = int(degen.sum())
 
     # --- map onto the mcnu index via the evtrec link ----------------------------
     link = _evtrec_link(mcdf).to_numpy(float)
@@ -403,6 +455,8 @@ def _evtrec_kinematics(er, mcdf):
 detvar_rwt_files = [
   'SBND_WMXThetaXW.txt',
   'SBND_WMYZ.txt',
+  'ICARUSRun2_WMYZ.txt',
+  'ICARUSRun4_WMYZ.txt',
   'SBND_DENT.txt',
   ['SBND_0xSCE.txt', 'SBND_2xSCE.txt'],
   'ICARUSRun2_SCE.txt',
@@ -441,6 +495,8 @@ detvar_rwt_files = [
 detvar_rwt_lbls = [
   'WireMod_SBND_multisigma_WMXThetaXW',
   'WireMod_SBND_multisigma_WMYZ',
+  'WireMod_ICARUSRun2_multisigma_WMYZ',
+  'WireMod_ICARUSRun4_multisigma_WMYZ',
   'DENT_SBND_multisigma_DENT',
   'SCE_SBND_multisigma_SCE',
   'SCE_ICARUSRun2_multisigma_SCE',
@@ -490,7 +546,7 @@ std_drops = ['is_clear_cosmic', 'crlongtrkdiry', 'p_len', 'has_stub',
              'mu_chi2smear5_of_prot_cand', 'tmatch_pur', 'tmatch_eff', 
              'true_baseline', 'true_nu_pdg_x', 'true_nu_pdg_y',
              'true_nmu_27MeV', 'true_np_20MeV', 'true_np_50MeV', 
-             'true_npi_30MeV', 'is_cosmic', 'flash_sumpe', 'true_mucand_p', 
+             'true_npi_30MeV', 'flash_sumpe', 'true_mucand_p', 
              'true_pcand_p', 'p_true_p', 'true_mu_end_x', 
              'true_p_end_x', 'true_mu_end_y', 'true_p_end_y', 'true_mu_end_z', 
              'true_p_end_z','crthit', 'true_nu_E', 'p_true_pdg', 'mu_true_pdg', 
@@ -651,6 +707,8 @@ def _apply_variations(df, shift_binding_E, split_tracks,
         df = syst.shift_binding_energy(df, BE_SHIFT, fraction=f, scale=_weight_col(df))
     return df
 
+_DETECTOR_RUN = {"SBND": 1, "ICARUS Run2": 2, "ICARUS Run4": 4}
+
 def load_one(fname, idf,
     detector=None, # One of SBND, ICARUS, ICARUS Run4
     include_syst=True, nuniv=100, spline=False, xsec_univ=False, xsec_spline=False,# systematic handling
@@ -688,6 +746,7 @@ def load_one(fname, idf,
             return _apply_variations(df, shift_binding_E, split_tracks, shift_fraction, split_fraction), match, pot
 
     df =  pd.read_hdf(fname, evtname % idf)
+
     hdr = pd.read_hdf(fname, hdrname % idf)
     ismc = hdr.ismc.iloc[0] == 1
 
@@ -719,13 +778,27 @@ def load_one(fname, idf,
     # if needed, include neutrino energy in matching information
     if match_Enu:
         mcdf = pd.read_hdf(fname, mcname % idf)
+        mcdf["detector"] = detector
+        if "Run2" in detector.replace(" ", ""):
+            mcdf["Run"] = 2
+        elif "Run4" in detector.replace(" ", ""):
+            mcdf["Run"] = 4
+        elif "SBND" in detector.replace(" ", ""):
+            mcdf["Run"] = 1
+        else:
+            print("Run ambiguous!")
+
         match = match.merge(mcdf.nu_E.groupby(level=[0,1]).max().rename("nu_E0"), on=["__ntuple", "entry"], how="left")
         match_ind = list(match.columns)
 
         # Add in other meta-data to match.
+        # Newer makedf productions stamp detector/Run onto the mcnu frame
+        # (makedf.py:769-770); the sbn-rewgted-13/-14 files predate that, so fall
+        # back to the detector this load was told to use. gc._fv_cut only consults
+        # Run when the label is the ambiguous "ICARUS", which the fallback never is.
         vtx = pd.DataFrame({
-          "detector": mcdf.detector,
-          "Run": mcdf.Run,
+          "detector": mcdf.detector if "detector" in mcdf.columns else detector,
+          "Run": mcdf.Run if "Run" in mcdf.columns else _DETECTOR_RUN[detector],
           "x": mcdf.pos_x,
           "y": mcdf.pos_y,
           "z": mcdf.pos_z,
@@ -814,7 +887,8 @@ def load_one(fname, idf,
             frac = gstats["n_resolved"] / max(gstats["n_mcnu"], 1)
             print(f"[{os.path.basename(fname)} idf={idf}] evtrec: "
                   f"{gstats['n_resolved']}/{gstats['n_mcnu']} neutrinos resolved "
-                  f"({100*frac:.1f}%), vertex check {gstats['vtx_ok']:.5f}")
+                  f"({100*frac:.1f}%), vertex check {gstats['vtx_ok']:.5f}, "
+                  f"{gstats['n_degen']} collinear-lepton frame(s)")
             if gstats["n_resolved"] > 0 and not (gstats["vtx_ok"] > 0.999):
                 print(f"WARNING: {os.path.basename(fname)} idf={idf}: the GENIE event "
                       f"record link does not reproduce the mcnu vertex "
@@ -935,7 +1009,7 @@ def load_one(fname, idf,
         for d in ["SBND", "ICARUS Run2", "ICARUS Run4"]:
             col_str = f"multisigma_{d.replace(' ', '')}_POT"
             multisigma_cols.append(col_str)
-            if det == d:
+            if detector == d:
                 skim[f"{col_str}"] = [list(pot_syst.values()) for _ in range(len(wgt))]
             else:
                 skim[f"{col_str}"] = [[1.0]*7 for _ in range(len(wgt))]
@@ -1079,14 +1153,13 @@ def load_one(fname, idf,
             else:
                 col_str = s
 
-            # allow for f 
-            if det.replace(' ', '') in fs[0]:
+            # allow for f
+            if detector.replace(' ', '') in fs[0]:
                 s_df = rw.apply_map(mrg, fs, s)
                 mrg[col_str] = s_df
             elif not col_str in mrg.columns:
             # Don't overwrite existing columns with defaults (eg BIND)
                 mrg[col_str] = [[1.0]*(len(fs)+1) for _ in range(len(mrg))]
-
             multisigma_cols.append(col_str)
 
     univ_cols = [col for col in skim.columns if "univ" in col]
