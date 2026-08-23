@@ -1,6 +1,8 @@
 import os
 import hashlib
 import json
+import time
+import sys
 
 import pandas as pd
 import numpy as np
@@ -14,7 +16,9 @@ from functools import partial
 import syst
 import rwt_map as rw
 
-import gump_cuts as gc
+workspace_root = os.getcwd()
+sys.path.insert(0, workspace_root + "/../gumple/")
+import gumple_cuts as gmpl
 
 def tmatch(reco, mc):
     for c in mc.columns:
@@ -549,7 +553,7 @@ std_drops = ['is_clear_cosmic', 'crlongtrkdiry', 'p_len', 'has_stub',
              'true_npi_30MeV', 'flash_sumpe', 'true_mucand_p', 
              'true_pcand_p', 'p_true_p', 'true_mu_end_x', 
              'true_p_end_x', 'true_mu_end_y', 'true_p_end_y', 'true_mu_end_z', 
-             'true_p_end_z','crthit', 'true_nu_E', 'p_true_pdg', 'mu_true_pdg', 
+             'true_p_end_z', 'true_nu_E', 'p_true_pdg', 'mu_true_pdg', 
              'mu_chi22lo_of_mu_cand', 'mu_chi22hi_of_mu_cand', 
              'prot_chi22lo_of_mu_cand', 'prot_chi22hi_of_mu_cand',
              'mu_chi22lo_of_prot_cand', 'mu_chi22hi_of_prot_cand', 
@@ -598,8 +602,8 @@ def _write_cache(cache_file, df, match, pot):
 # systematic: the cathodes sit at the center of each ICARUS drift volume.
 SPLIT_REGIONS = {
     "Z=0":          ("z", 0.0),
-    "East Cathode": ("x", 0.5*(gc.ICARUSRun4FVCuts["C0"]["x"]["min"] + gc.ICARUSRun4FVCuts["C0"]["x"]["max"])),
-    "West Cathode": ("x", 0.5*(gc.ICARUSRun4FVCuts["C1"]["x"]["min"] + gc.ICARUSRun4FVCuts["C1"]["x"]["max"])),
+    "East Cathode": ("x", 0.5*(gmpl.ICARUSRun4FVCuts["C0"]["x"]["min"] + gmpl.ICARUSRun4FVCuts["C0"]["x"]["max"])),
+    "West Cathode": ("x", 0.5*(gmpl.ICARUSRun4FVCuts["C1"]["x"]["min"] + gmpl.ICARUSRun4FVCuts["C1"]["x"]["max"])),
 }
 
 # Fraction of the plane-crossing muons that split_tracks actually splits, per
@@ -721,7 +725,6 @@ def load_one(fname, idf,
     shift_fraction=None, split_fraction=None, # fraction of events each variation is applied to (None -> BE_FRACTION / SPLIT_FRAC)
     cache_dir=None, # directory to cache output; None disables caching
     flashname=FLASH, hdrname=HDR, evtname=EVT, wgtname=WGT, mcname=MC, crtname=CRT, evtrecname=EVTREC, drops=None, lightmem=False): # override default table names
-
     assert(detector == "SBND" or detector == "ICARUS Run2" or detector == "ICARUS Run4")
     # Check cache
     if cache_dir is not None:
@@ -746,7 +749,6 @@ def load_one(fname, idf,
             return _apply_variations(df, shift_binding_E, split_tracks, shift_fraction, split_fraction), match, pot
 
     df =  pd.read_hdf(fname, evtname % idf)
-
     hdr = pd.read_hdf(fname, hdrname % idf)
     ismc = hdr.ismc.iloc[0] == 1
 
@@ -773,7 +775,7 @@ def load_one(fname, idf,
     match = hdr[["run", "evt"]]
     # The columns that identify an event across samples. Everything merged onto `match`
     # after this point is metadata carried along as a column, NOT part of the key --
-    # in particular AVnu, which is derived from gc._fv_cut and so depends on `detector`.
+    # in particular AVnu, which is derived from gmpl._fv_cut and so depends on `detector`.
     match_ind = list(match.columns)
     # if needed, include neutrino energy in matching information
     if match_Enu:
@@ -794,7 +796,7 @@ def load_one(fname, idf,
         # Add in other meta-data to match.
         # Newer makedf productions stamp detector/Run onto the mcnu frame
         # (makedf.py:769-770); the sbn-rewgted-13/-14 files predate that, so fall
-        # back to the detector this load was told to use. gc._fv_cut only consults
+        # back to the detector this load was told to use. gmpl._fv_cut only consults
         # Run when the label is the ambiguous "ICARUS", which the fallback never is.
         vtx = pd.DataFrame({
           "detector": mcdf.detector if "detector" in mcdf.columns else detector,
@@ -803,8 +805,9 @@ def load_one(fname, idf,
           "y": mcdf.pos_y,
           "z": mcdf.pos_z,
         })
-        any_in_AV = gc._fv_cut(vtx, 0, 0, 0, 0).groupby(level=[0,1]).any().rename("AVnu")
+        any_in_AV = gmpl._fv_cut(vtx, 0, 0, 0, 0).groupby(level=[0,1]).any().rename("AVnu")
         match = match.merge(any_in_AV, on=["__ntuple", "entry"], how="left")
+
 
     df = df.merge(match, on=["__ntuple", "entry"], how="left")
 
@@ -1016,17 +1019,26 @@ def load_one(fname, idf,
 
     if sep_flux_univ:
         for j, s in enumerate(flux_syst):
-            if not 'multisim' in s:
-                col_str = 'multisim_'+s
-            else:
-                col_str = s
-            multisim_cols.append(col_str)
             w = wgt[s]
-            if lightmem:
-                float64_cols = w.select_dtypes(include=["float64"]).columns
-                w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
-            stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
+            col_str = s if 'multisim' in s else 'multisim_' + s
+            n_univs = min(100, nuniv)
+            univ_cols = [f"univ_{i}" for i in range(n_univs)]
+            stacked_variants = w[univ_cols].to_numpy(dtype=np.float32).T
+            np.nan_to_num(stacked_variants, copy=False, nan=1.0, posinf=1.0, neginf=1.0)
             skim[col_str] = stacked_variants.T.tolist()
+            multisim_cols.append(col_str)
+
+            #if not 'multisim' in s:
+            #    col_str = 'multisim_'+s
+            #else:
+            #    col_str = s
+            #multisim_cols.append(col_str)
+            #w = wgt[s]
+            #if lightmem:
+            #    float64_cols = w.select_dtypes(include=["float64"]).columns
+            #    w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
+            #stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
+            #skim[col_str] = stacked_variants.T.tolist()
 
     if sep_g4_univ:
         for j, s in enumerate(g4_syst):
@@ -1038,7 +1050,8 @@ def load_one(fname, idf,
             w = wgt[s]
             if lightmem:
                 float64_cols = w.select_dtypes(include=["float64"]).columns
-                w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
+                if len(float64_cols) > 0:
+                            w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
             stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
             skim[col_str] = stacked_variants.T.tolist()
 
@@ -1070,6 +1083,7 @@ def load_one(fname, idf,
 
     if xsec_spline:
         for j, s in enumerate(xsec_syst):
+
             if "ps1" in wgt[s]:
                 w = wgt[s].fillna(1).replace([np.inf, -np.inf], 1)
                 stacked_variants = np.vstack([
@@ -1104,16 +1118,13 @@ def load_one(fname, idf,
                 skim[col_str] = stacked_variants.T.tolist()
                 multisigma_cols.append(col_str)
             elif "multisim" in s:
-                w = wgt[s]#.fillna(1).replace([np.inf, -np.inf], 1)
-                if lightmem:
-                    float64_cols = w.select_dtypes(include=["float64"]).columns
-                    w.loc[:, float64_cols] = w.loc[:, float64_cols].astype("float32")
-                stacked_variants = np.vstack([np.nan_to_num(w["univ_%i" % i].to_numpy(), nan=1.0, posinf=1.0, neginf=1.0) for i in range(min(100, nuniv))])
+                w = wgt[s]
+                n_univs = min(100, nuniv)
+                univ_cols = [f"univ_{i}" for i in range(n_univs)]
+                stacked_variants = w[univ_cols].to_numpy(dtype=np.float32).T
+                np.nan_to_num(stacked_variants, copy=False, nan=1.0, posinf=1.0, neginf=1.0)
                 skim[s] = stacked_variants.T.tolist()
-                if not 'multisim' in s:
-                    col_str = 'multisim_'+s
-                else:
-                    col_str = s
+                col_str = s if 'multisim' in s else 'multisim_' + s
                 multisim_cols.append(s)
 
     else:

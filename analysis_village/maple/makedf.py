@@ -1,9 +1,4 @@
 """MAPLE (1mu + N>1 p) dataframe builders for cafpyana.
-
-Port of the CAFANA selection in
-NicolaICARUS/MAPLE_GUMP/icarus/helper_eff_cf_FINAL_..._Trigger.h
-and the SpillMultiVar output variables in helper_variables.h.
-
 Detector support:
   ICARUS -- the original selection, bit-compatible with the CAFANA port.
   SBND   -- generalization: SBND geometry for FV (high-YZ volume dropped,
@@ -44,7 +39,9 @@ Post-hoc (chi2-free) candidate scheme:
 Selection option:
   selection="none"   -- keep all slices, with all cut booleans (default)
   selection="presel" -- keep slices passing the PID-free MAPLE preselection
-                        (sanity + FV + CRT veto + cryo-light + containment)
+                        (sanity + FV + all-track containment + cathode + a
+                        muon and >=1 candidate proton; no CRT veto or
+                        cryo-light)
   selection="full"   -- keep slices passing the full MAPLE selection
                         (evaluated with the nominal chi2)
 """
@@ -54,16 +51,14 @@ import pandas as pd
 from pyanalib.pandas_helpers import *
 from makedf.util import *
 from makedf.makedf import (
-    loadbranches, make_slcdf, make_trkdf, make_trkhitdf, make_crthitdf,
+    loadbranches, make_slcdf, make_trkdf, make_trkhitdf, make_crthitdf, make_opflashdf,
     make_hdrdf, make_triggerdf, make_potdf_bnb, make_mcnudf,
     make_genie_evtrec_df, _build_genie_evtrec_df,
 )
 from makedf import chi2pid
 
 from analysis_village.gump.kinematics import *
-from analysis_village.maple.maple_cuts import *
-import analysis_village.gump.gump_cuts as gc
-from analysis_village.maple.maple_sel import maple_selection
+import analysis_village.gumple.gumple_cuts as gmpl
 from analysis_village.maple import chi2pid_cafana
 from makedf.branches import (
     crtpmtbranches, shwbranches,
@@ -75,8 +70,21 @@ PID_UNKNOWN, PID_PROTON, PID_PION, PID_SHOWER, PID_OTHER = 0, 1, 2, 3, 4
 # TruthClass: 0=1mu1p, 1=1muNp, 2=Other, 3=Cosmic, 4=Invalid
 CLS_1MU1P, CLS_1MUNP, CLS_OTHER, CLS_COSMIC, CLS_INVALID = 0, 1, 2, 3, 4
 
-CALO_VARIATIONS = ["cv", "alpha_p", "alpha_m", "beta_p", "beta_m", "R_p", "R_m", "R_p25", "dedxbias"]
+# All chi2 variation suffixes stored in the evt df (when do_calo_syst=True),
+# plus the CAFANA-compat chi2 stored under the same scheme.
 SCALE_SMEAR_VARIATIONS = ["lo", "hi", "2lo", "2hi", "smear5", "smear13", "sqsmear15"]
+CALO_VARIATIONS = ["cv", "alpha_p", "alpha_m", "beta_p", "beta_m", "R_p", "R_m", "R_p25", "dedxbias"]
+CHI2_VARIATIONS = SCALE_SMEAR_VARIATIONS + CALO_VARIATIONS + ["cafana"]
+
+# The four per-slice chi2 candidate columns, GUMP naming ("%s" is the
+# variation suffix; "" is nominal).
+CHI2_CAND_COLS = [
+    "mu_chi2%s_of_mu_cand",
+    "prot_chi2%s_of_mu_cand",
+    "mu_chi2%s_of_prot_cand",
+    "prot_chi2%s_of_prot_cand",
+]
+
 
 def _flatcols(df):
     """Flatten a multiindex-column dataframe to underscore-joined names."""
@@ -84,7 +92,6 @@ def _flatcols(df):
     df.columns = ["_".join([str(c) for c in (col if isinstance(col, tuple) else (col,)) if str(c) != ""])
                   for col in df.columns]
     return df
-
 
 def _reindex(series, index, fill):
     return series.reindex(index).fillna(fill)
@@ -112,7 +119,10 @@ def maple_truth_classdf(f, det, run):
     nuidx = mc.index
 
     prim = _flatcols(loadbranches(f["recTree"], mcprimbranches + mcprimvisEbranches).rec.mc.nu.prim)
+    prim["detector"] = det
+    prim["Run"] = run
     prim.index.names = ["entry", "inu", "iprim"]
+
     tp = _flatcols(loadbranches(f["recTree"], trueparticlebranches).rec.true_particles)
     tp.index.names = ["entry", "itp"]
 
@@ -136,7 +146,7 @@ def maple_truth_classdf(f, det, run):
     # ---- daughters: true_particles with parent == prim.G4ID (same entry) ----
     prim_r = prim.reset_index()
     tp_r = tp.reset_index()
-    m = prim_r[["entry", "inu", "iprim", "G4ID", "cryostat"]].merge(
+    m = prim_r[["entry", "inu", "iprim", "G4ID", "cryostat", "detector", "Run"]].merge(
         tp_r, left_on=["entry", "G4ID"], right_on=["entry", "parent"],
         suffixes=("", "_d"))
     if len(m):
@@ -148,7 +158,7 @@ def maple_truth_classdf(f, det, run):
         # daughter containment check: skip cryostat<0 or end == -9999
         d_valid_cont = (m.cryostat_d >= 0) & m.d_charged & \
             ~((m.end_x == -9999) | (m.end_y == -9999) | (m.end_z == -9999))
-        m["d_uncont"] = d_valid_cont & ~gc.endfv_cut(m, det=det, run=run)
+        m["d_uncont"] = d_valid_cont & ~gmpl.prefix_fv_cut(m, "end")
         # note: for the pi0-gamma veto and visE sums, C++ has no cryostat check
         # on the daughter itself
         g = m.groupby(["entry", "inu", "iprim"])
@@ -172,7 +182,7 @@ def maple_truth_classdf(f, det, run):
     prim_veto = cpi_veto | pi0_veto | gamma_veto
 
     # ---- containment (all_contained_mc): charged primaries, no -9999 skip ----
-    prim_uncont = is_charged & ~gc.endfv_cut(prim, det=det, run=run)
+    prim_uncont = is_charged & ~gmpl.prefix_fv_cut(prim, "end")
 
     # ---- per-nu aggregation ----
     grp = prim.groupby(level=["entry", "inu"])
@@ -213,7 +223,7 @@ def maple_truth_classdf(f, det, run):
     # ---- classification ----
     pos_nan = mc.position_x.isna() | mc.position_y.isna() | mc.position_z.isna()
     not_numucc = (np.abs(mc.pdg) != 14) | (mc.iscc == 0)
-    not_fv = ~gc.true_fv_cut(mc)
+    not_fv = ~gmpl.prefix_fv_cut(mc, "position")
     #good_mu = (n_mu == 1) & (mu_length > MIN_MUON_LENGTH) & (mu_length < MAX_MUON_LENGTH)
 
     maple_class = np.select(
@@ -244,23 +254,24 @@ def maple_truth_classdf(f, det, run):
 # Per-pfp candidate machinery (chi2-free; chi2 cuts live in maple_sel)
 # =====================================================================
 def _find_candidates(P):
-    """Chi2-free muon + candidate-proton finding and fixed pfp counting.
+    """Chi2-free muon + candidate-pfp finding and fixed pfp counting.
 
     P: flat per-pfp frame (index entry, slc, pfp).
     Returns (mu_ilocs [per-slice Index of muon rows],
              is_prot_cand [bool Series over P],
-             counts DataFrame per slice [n_proton, n_shower, n_other]).
+             counts DataFrame per slice [n_pfp, n_pfp_no_calo, n_shower, n_other]).
 
     The muon is the longest track passing the chi2-free part of the old
-    find_muon mask.  Candidate protons are every other pfp passing the
-    id_pfp gates with dist_start < 10 -- the set the old id_pfp split into
-    pion/proton by chi2.  The remaining pfps keep the chi2-independent
-    shower/other/unknown classification, so the counts are fixed under
-    calorimetric variations.  All masks mirror the C++ skip conditions,
-    including NaN behavior.
+    find_muon mask.  A candidate pfp is any pandora pfp that is primary,
+    has calo points, and starts within 10 cm of the vertex; n_pfp counts
+    the candidate pfps in the slice (the muon included).  Candidate
+    protons are the non-muon candidate pfps -- the set whose worst-case
+    chi2 aggregates the proton PID cut is applied to.  The remaining pfps
+    keep the chi2-independent shower/other/unknown classification, so the
+    counts are fixed under calorimetric variations.
     """
 
-    keep = get_base_muon_mask(P, level="trk")
+    keep = gmpl.get_base_muon_mask(P, level="trk")
 
     cand = P[keep]
     if len(cand):
@@ -272,13 +283,21 @@ def _find_candidates(P):
     if len(mu_ilocs):
         is_mu.loc[pd.Index(mu_ilocs.values)] = True
 
-    # ---- id_pfp gates (the chi2-free skip conditions) ----
+    # ---- candidate pfps: primary, has calo points, starts within 10 cm ----
+    # NaN semantics: NaN ncalo/dist_start fail the comparisons -> not a candidate.
+    is_cand = P.prim_pfp.astype(bool) & (P.ncalo > 0) & (P.dist_start < 10.0)
+    is_prot_cand = is_cand & ~is_mu
+
+    # would-be candidates without calo: primary, starts within 10 cm, but no
+    # calo points -- invisible to n_pfp/PID (classified "unknown" below)
+    is_cand_no_calo = P.prim_pfp.astype(bool) & (P.ncalo == 0) & (P.dist_start < 10.0)
+
+    # ---- id_pfp gates (the chi2-free skip conditions), kept for the
+    # shower/other/unknown classification of the remaining pfps ----
     unknown0 = (~P.prim_pfp) | P.start_x.isna() | P.end_x.isna() | P.len.isna()
     unknown1 = P.min_dist > 50.0 # VTX_MAX_DIST
     no_calo = P.ncalo == 0
     gate = ~unknown0 & ~unknown1 & ~no_calo
-
-    is_prot_cand = gate & (P.dist_start < 10.0) & ~is_mu
 
     # remaining pfps: chi2-independent shower/other/unknown classification
     shw_unknown = P.shw_energy2.isna()
@@ -291,7 +310,10 @@ def _find_candidates(P):
 
     grp = lambda s: s.groupby(level=[0, 1]).sum()
     counts = pd.DataFrame({
-        "n_proton": grp(is_prot_cand.astype(int)),
+        # muon included via the union: the muon counts toward n_pfp even in
+        # the (rare) case it misses the candidate definition itself
+        "n_pfp": grp((is_cand | is_mu).astype(int)),
+        "n_pfp_no_calo": grp(is_cand_no_calo.astype(int)),
         "n_shower": grp((pid_rest == PID_SHOWER).astype(int)),
         "n_other": grp((pid_rest == PID_OTHER).astype(int)),
     })
@@ -319,53 +341,33 @@ def _proton_aggregates(P, is_prot_cand, mincols, maxcols):
             out["%s_%s" % (fn, col)] = agg
     return pd.DataFrame(out)
 
-def fetch_perentry(f, entries):
-    # ------------------------------------------------------------------
-    # spill-level inputs
-    # ------------------------------------------------------------------
-    crtpmt = loadbranches(f["recTree"], crtpmtbranches).rec.crtpmt_matches
-
-    CRYO_LIGHT_TMIN = -0.6
-    CRYO_LIGHT_TMAX = 1.8
-    CRYO_LIGHT_PE_THRESHOLD = 3000. / 0.341  # valid for Run 4
-
-    # cryo_selection_from_light
-    inwin = (crtpmt.flashGateTime > CRYO_LIGHT_TMIN) & (crtpmt.flashGateTime < CRYO_LIGHT_TMAX)
-    haspe = ~(crtpmt.flashPE < CRYO_LIGHT_PE_THRESHOLD)
-    west = (inwin & haspe & (crtpmt.flashPosition.x > 0)).groupby(level=0).any()
-    east = (inwin & haspe & (crtpmt.flashPosition.x < 0)).groupby(level=0).any()
-    perentry = pd.DataFrame(index=pd.Index(entries.unique(), name="entry"))
-    perentry["west"] = _reindex(west, perentry.index, False).astype(bool)
-    perentry["east"] = _reindex(east, perentry.index, False).astype(bool)
-    perentry["cryo_light"] = np.select(
-        [perentry.west & perentry.east, perentry.west, perentry.east],
-        [2, 1, 0], default=-1)
-
-    # k_pe: max flash PE in the cryo-light window, no PE threshold, default 0
-    maxpe = crtpmt.flashPE[inwin].groupby(level=0).max()
-    perentry["flash_maxpe"] = _reindex(maxpe, perentry.index, 0.0)
-
-    # Per-cryostat max in-window flash PE, RAW (no MC PE scale here): the
-    # GUMP flash_maxpe_cryo0/1 schema that loaddf.load_one picks from by the
-    # slice cryostat (cryo0 = East, x < 0; cryo1 = West, x > 0) and scales.
-    maxpe_east = crtpmt.flashPE[inwin & (crtpmt.flashPosition.x < 0)].groupby(level=0).max()
-    maxpe_west = crtpmt.flashPE[inwin & (crtpmt.flashPosition.x > 0)].groupby(level=0).max()
-    perentry["flash_maxpe_cryo0"] = _reindex(maxpe_east, perentry.index, 0.0)
-    perentry["flash_maxpe_cryo1"] = _reindex(maxpe_west, perentry.index, 0.0)
-
-    # kCRTNeutrino (CRT top veto)
-    CRT_VETO_TMIN = -1.0
-    CRT_VETO_TMAX = 1.8
-    CRT_VETO_PLANE_MIN = 29  # exclusive
-    CRT_VETO_PLANE_MAX = 50  # exclusive
-
-    # kCRTNeutrino: top-CRT veto
+def add_crt(f, S):
+    # Add in crt hit matching for ICARUS
     crt = make_crthitdf(f)
-    vetohit = ((crt.time > CRT_VETO_TMIN) & (crt.time < CRT_VETO_TMAX) &
-               (crt.plane > CRT_VETO_PLANE_MIN) & (crt.plane < CRT_VETO_PLANE_MAX)).groupby(level=0).any()
-    perentry["crthit"] = _reindex(vetohit, perentry.index, False).astype(bool)
+    S = S.join(((crt.time > -1) & (crt.time < 1.8) & (crt.plane != 50)).groupby(level=[0]).any().rename("crthit"))
+    S = S.join(((crt.time > -1) & (crt.time < 1.8) & (crt.plane != 50) & (crt.truth.bestmatch_id != -1)).groupby(level=[0]).any().rename("crthit_ismc"))
+    S["crthit"] = S.crthit.fillna(False).astype(bool)
+    S["crthit_ismc"] = S.crthit_ismc.fillna(False).astype(bool)
+    return S
 
-    return perentry
+def add_pmt(f, S, DETECTOR):
+    # Flash value for trigger emulation. Note: these need to be scaled per-detector, per-Run
+    flashes = make_opflashdf(f)
+    if DETECTOR == "ICARUS":
+        timename = "firsttime"
+    elif DETECTOR == "SBND":
+        timename = "time"
+    intime = (flashes[timename] > -5) & (flashes[timename] < 5)
+    maxpe = (flashes.totalpe*intime).groupby(level=[0]).max().rename("flash_maxpe")
+    S = S.join(maxpe)
+    sumpe = (flashes.totalpe*intime).groupby(level=[0]).sum().rename("flash_sumpe")
+    S = S.join(sumpe)
+
+    flash_cryo0 = (flashes.totalpe * intime * (flashes.cryo == 0)).groupby(level=[0]).max().rename("flash_maxpe_cryo0")
+    flash_cryo1 = (flashes.totalpe * intime * (flashes.cryo == 1)).groupby(level=[0]).max().rename("flash_maxpe_cryo1")
+    S = S.join(flash_cryo0)
+    S = S.join(flash_cryo1)
+    return S
 
 def fetch_metadata(f):
     det = loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
@@ -396,6 +398,7 @@ def fetch_info(f):
         "slc_vtx_z": slcdf.slc.vertex.z,
         "charge_center_z": slcdf.slc.charge_center.z,
         "nu_score": slcdf.slc.nu_score,
+        "crlongtrkdiry": slcdf.slc.nuid.crlongtrkdiry,
         "tmatch_idx": slcdf.slc.tmatch.idx,
         "tmatch_eff": slcdf.slc.tmatch.eff,
         "tmatch_pur": slcdf.slc.tmatch.pur,
@@ -408,6 +411,28 @@ def fetch_info(f):
         "true_vtx_x": slcdf.slc.truth.position.x,
         "true_vtx_y": slcdf.slc.truth.position.y,
         "true_vtx_z": slcdf.slc.truth.position.z,
+        # slice-level true signal particles (GUMP true_mu_*/true_p_*/true_p2_*)
+        "true_mu_p": slcdf.slc.truth.mu.totp,
+        "true_mu_dir_x": slcdf.slc.truth.mu.dir.x,
+        "true_mu_dir_y": slcdf.slc.truth.mu.dir.y,
+        "true_mu_dir_z": slcdf.slc.truth.mu.dir.z,
+        "true_mu_end_x": slcdf.slc.truth.mu.end.x,
+        "true_mu_end_y": slcdf.slc.truth.mu.end.y,
+        "true_mu_end_z": slcdf.slc.truth.mu.end.z,
+        "true_p_p": slcdf.slc.truth.p.totp,
+        "true_p_dir_x": slcdf.slc.truth.p.dir.x,
+        "true_p_dir_y": slcdf.slc.truth.p.dir.y,
+        "true_p_dir_z": slcdf.slc.truth.p.dir.z,
+        "true_p_end_x": slcdf.slc.truth.p.end.x,
+        "true_p_end_y": slcdf.slc.truth.p.end.y,
+        "true_p_end_z": slcdf.slc.truth.p.end.z,
+        "true_p2_p": slcdf.slc.truth.p2.totp,
+        "true_p2_dir_x": slcdf.slc.truth.p2.dir.x,
+        "true_p2_dir_y": slcdf.slc.truth.p2.dir.y,
+        "true_p2_dir_z": slcdf.slc.truth.p2.dir.z,
+        "true_p2_end_x": slcdf.slc.truth.p2.end.x,
+        "true_p2_end_y": slcdf.slc.truth.p2.end.y,
+        "true_p2_end_z": slcdf.slc.truth.p2.end.z,
         "ismc" : ismc,
     })
     S["slice_index"] = S.index.get_level_values(1)
@@ -439,6 +464,12 @@ def fetch_info(f):
         "p_proton": trkdf.pfp.trk.rangeP.p_proton,
         "trackScore": trkdf.pfp.trackScore,
         "true_genp_x": trkdf.pfp.trk.truth.p.genp.x,
+        "true_genp_y": trkdf.pfp.trk.truth.p.genp.y,
+        "true_genp_z": trkdf.pfp.trk.truth.p.genp.z,
+        "true_pdg": trkdf.pfp.trk.truth.p.pdg,
+        "true_end_x": trkdf.pfp.trk.truth.p.end.x,
+        "true_end_y": trkdf.pfp.trk.truth.p.end.y,
+        "true_end_z": trkdf.pfp.trk.truth.p.end.z,
         "shw_energy2": shwdf.plane.I2.energy,
     })
 
@@ -454,31 +485,25 @@ def fetch_info(f):
 
     # std::min(a, b) semantics: b if b < a else a  (NaN b -> a; NaN a -> NaN)
     P["min_dist"] = np.where(np.isnan(dist_end), P.dist_start, np.minimum(P.dist_start, dist_end))
-    P["contained10"] = gc.endfv_cut(P)
+    P["contained10"] = gmpl.prefix_fv_cut(P, "end")
     P["ke_pion"] = kinetic_energy(PION_MASS, np.sqrt((P.dir_x * P.p_pion)**2 + (P.dir_y * P.p_pion)**2 + (P.dir_z * P.p_pion)**2))
     P["ke_proton"] = kinetic_energy(PROTON_MASS, np.sqrt((P.dir_x * P.p_proton)**2 + (P.dir_y * P.p_proton)**2 + (P.dir_z * P.p_proton)**2))
-   
+  
     if "ICARUS" in DETECTOR:
-        perentry = fetch_perentry(f, S.index.get_level_values(0))
+        S = add_crt(f, S)
     else:
-        perentry = pd.DataFrame(index=pd.Index(S.index.get_level_values(0).unique(), name="entry"))
-        perentry["cryo_light"] = -1
-        perentry["flash_maxpe"] = np.nan
-        perentry["flash_maxpe_cryo0"] = np.nan
-        perentry["flash_maxpe_cryo1"] = np.nan
-        perentry["crthit"] = False
+        S["crthit"] = False 
+        S["crthit_ismc"] = False 
 
-    S = S.join(perentry[["cryo_light", "flash_maxpe_cryo0", "flash_maxpe_cryo1", "flash_maxpe", "crthit"]])
+    S = add_pmt(f, S, DETECTOR)
+
     return S, P, DETECTOR, RUN, ismc
 
-def PID_calcs(f, P, do_calo_syst=True):
+def PID_calcs(f, P, DETECTOR, ismc, do_calo_syst=True):
     # ------------------------------------------------------------------
     # PID: both flavors
     # ------------------------------------------------------------------
     trkhitdf = make_trkhitdf(f)
-
-    DETECTOR = P.detector.iloc[0]
-    ismc = P.ismc.iloc[0]
 
     # number of plane-2 calo points (compute_chi2 returns {} when empty)
     ncalo = trkhitdf.groupby(level=[0, 1, 2]).size()
@@ -563,11 +588,15 @@ def fetch_candidates(S, P, do_calo_syst):
     for c in counts.columns:
         S[c] = counts[c]
     S["has_muon"] = has_mu
-    S["cut_np"] = counts.n_proton > 0
+    # muon + at least one other candidate pfp (same semantics as the old
+    # n_proton > 0 once combined with has_muon)
+    S["cut_np"] = counts.n_pfp >= 2
     S["cut_0shwother"] = (counts.n_shower == 0) & (counts.n_other == 0)
 
     # worst-case cut variables over the candidate protons (min for cuts
-    # with direction >, max for cuts with direction <)
+    # with direction >, max for cuts with direction <): min chi2u / max chi2p
+    # over ALL non-muon candidate pfps, so the proton PID cut on the max chi2p
+    # only passes when every candidate is proton-like
     aggs = _proton_aggregates(
         P, is_prot_cand,
         mincols=["trackScore", "ke_proton"] + ["chi2u_%s" % fl for fl in chi2_suffixes.values()],
@@ -583,8 +612,10 @@ def fetch_candidates(S, P, do_calo_syst):
     # ------------------------------------------------------------------
     # candidate variables (muon + leading candidate proton)
     # ------------------------------------------------------------------
+    truthcols = ["true_pdg", "true_genp_x", "true_genp_y", "true_genp_z",
+                 "true_end_x", "true_end_y", "true_end_z"]
     mucols = ["len", "start_x", "start_y", "start_z", "end_x", "end_y", "end_z", "dir_x", "dir_y", "dir_z",
-              "p_muon", "trackScore", "dist_start", "prim_pfp", "contained10"] + \
+              "p_muon", "trackScore", "dist_start", "prim_pfp", "contained10"] + truthcols + \
         ["chi2u_%s" % fl for fl in chi2_suffixes.values()] + \
         ["chi2p_%s" % fl for fl in chi2_suffixes.values()]
 
@@ -595,10 +626,12 @@ def fetch_candidates(S, P, do_calo_syst):
         mu = pd.DataFrame(columns=mucols, dtype=float)
     mu = mu.reindex(S.index)
 
-    # leading proton: longest candidate proton with len > 0 (find_longest_proton)
+    # leading proton: the longest-length non-muon candidate pfp (with len > 0);
+    # all p_* / true_pcand_* output columns come from this same pfp
     prodf = P[is_prot_cand & (P.len > 0)]
-    pcols = ["len", "end_x", "end_y", "end_z", "dir_x", "dir_y", "dir_z",
-             "p_proton", "ke_proton", "trackScore", "chi2u_cafpyana", "chi2p_cafpyana"]
+    pcols = ["len", "start_x", "start_y", "start_z", "end_x", "end_y", "end_z",
+             "dir_x", "dir_y", "dir_z", "dist_start",
+             "p_proton", "ke_proton", "trackScore", "chi2u_cafpyana", "chi2p_cafpyana"] + truthcols
     if len(prodf):
         p_ilocs = prodf.len.groupby(level=[0, 1]).idxmax()
         pro = P.loc[pd.Index(p_ilocs.values), pcols].copy()
@@ -620,29 +653,68 @@ def fetch_candidates(S, P, do_calo_syst):
 
     recoE = np.where(has_mu & found_proton, E_mu + proton_ke_sum, -999.0)
 
-    # transverse / angular variables (leading proton)
+    # ------------------------------------------------------------------
+    # psum: the summed proton-candidate system -- vector-sum momentum,
+    # summed KE and total energy, and unit direction over ALL candidate
+    # protons (the chi2-free non-muon candidate pfps, before PID cuts).
+    # NaN semantics follow _proton_aggregates: a NaN momentum/direction on
+    # any candidate (or no candidates at all) makes the psum NaN.
+    # ------------------------------------------------------------------
+    pc = P[is_prot_cand]
+    pcg = pd.DataFrame({
+        "px": pc.p_proton * pc.dir_x,
+        "py": pc.p_proton * pc.dir_y,
+        "pz": pc.p_proton * pc.dir_z,
+        "ke": pc.ke_proton,
+        "E": pc.ke_proton + PROTON_MASS,
+    }).groupby(level=[0, 1])
+    psum = pcg.sum()
+    cnt = pcg.count()
+    sz = pcg.size()
+    for c in psum.columns:
+        psum.loc[cnt[c] < sz, c] = np.nan
+    psum = psum.reindex(S.index)
+    psum_p = np.sqrt(psum.px**2 + psum.py**2 + psum.pz**2)
+    S["psum_p"] = psum_p
+    S["psum_ke"] = psum.ke
+    S["psum_E"] = psum.E
+    S["psum_dir_x"] = psum.px / psum_p
+    S["psum_dir_y"] = psum.py / psum_p
+    S["psum_dir_z"] = psum.pz / psum_p
+
+    # transverse / angular variables: the opening angle uses the LEADING
+    # proton candidate; the TKI (del_*) uses the summed proton system, so
+    # the variables generalize to the Np case
     p_mu = mu.p_muon
     dir_mu = pd.DataFrame({"x":mu.dir_x, "y":mu.dir_y, "z":mu.dir_z})
 
     p_p = pro.p_proton
     dir_p = pd.DataFrame({"x":pro.dir_x, "y":pro.dir_y, "z":pro.dir_z})
 
-    valid = np.isfinite(p_mu) & np.isfinite(p_p) & (p_mu > 0) & (p_p > 0)
+    # opening angle between the muon and the leading-length proton candidate:
+    # cosine = dot of the direction vectors normalized by their magnitudes
+    # (dirs are unit vectors, but normalize explicitly for safety)
+    mu_dirn = np.sqrt(np.einsum("ij,ij->i", dir_mu, dir_mu))
+    p_dirn = np.sqrt(np.einsum("ij,ij->i", dir_p, dir_p))
+    valid = np.isfinite(mu_dirn) & np.isfinite(p_dirn) & (mu_dirn > 0) & (p_dirn > 0)
     cosang = np.full(len(S), np.nan, dtype=float)
     dot = np.einsum("ij,ij->i", dir_mu, dir_p)
-    cosang[valid] = dot[valid] / (p_mu[valid] * p_p[valid])
+    cosang[valid] = dot[valid] / (mu_dirn[valid] * p_dirn[valid])
     cosang = np.clip(cosang, -1.0, 1.0)
     ang = np.degrees(np.arccos(cosang))
     S["mu_p_opening_angle_deg"] = ang
 
-    tki_leading = transverse_kinematics(p_mu, dir_mu, p_p, dir_p)
+    dir_psum = pd.DataFrame({"x": S.psum_dir_x, "y": S.psum_dir_y, "z": S.psum_dir_z})
+    tki_psum = transverse_kinematics(p_mu, dir_mu, S.psum_p, dir_psum, p_E=S.psum_E)
 
-    del_p = tki_leading['del_p']
-    del_Tp = tki_leading['del_Tp']
-    del_phi = tki_leading['del_phi']
-    del_alpha = tki_leading['del_alpha']
-    mu_E = tki_leading['mu_E']
-    p_E = tki_leading['p_E']
+    del_p = tki_psum['del_p']
+    del_Tp = tki_psum['del_Tp']
+    del_phi = tki_psum['del_phi']
+    del_alpha = tki_psum['del_alpha']
+    mu_E = tki_psum['mu_E']
+    # p_E stays the LEADING proton candidate's on-shell energy (the summed
+    # system energy is stored as psum_E)
+    p_E = np.sqrt(pro.p_proton**2 + PROTON_MASS**2)
 
     S["nu_E_calo"] = recoE
     S["mu_len"] = mu.len
@@ -662,17 +734,76 @@ def fetch_candidates(S, P, do_calo_syst):
     for suff, fl in chi2_suffixes.items():
         S["mu_chi2%s_of_mu_cand" % suff] = mu["chi2u_%s" % fl]
         S["prot_chi2%s_of_mu_cand" % suff] = mu["chi2p_%s" % fl]
+
+    # muon-candidate truth (truth of the reco track matched to the muon cand);
+    # GUMP kept both the mu_true_* alias and the true_mucand_* canonical name
+    mu_true_p = magdf(pd.DataFrame({"x": mu.true_genp_x, "y": mu.true_genp_y, "z": mu.true_genp_z}))
+    S["mu_true_p"] = mu_true_p
+    S["true_mucand_p"] = mu_true_p
+    S["mu_true_pdg"] = mu.true_pdg
+    S["true_mucand_pdg"] = mu.true_pdg
+    S["true_mucand_dir_x"] = mu.true_genp_x / mu_true_p
+    S["true_mucand_dir_y"] = mu.true_genp_y / mu_true_p
+    S["true_mucand_dir_z"] = mu.true_genp_z / mu_true_p
+    S["true_mucand_end_x"] = mu.true_end_x
+    S["true_mucand_end_y"] = mu.true_end_y
+    S["true_mucand_end_z"] = mu.true_end_z
+
     S["p_len"] = pro.len
-    S["p_ke"] = pro.ke_proton  # MeV (the old Proton_kinetic_leading was GeV)
+    S["p_ke"] = pro.ke_proton  # GeV, range-based
+    S["p_T"] = pro.ke_proton   # legacy GUMP alias (p_E - PROTON_MASS on-shell)
+    S["p_start_x"] = pro.start_x
+    S["p_start_y"] = pro.start_y
+    S["p_start_z"] = pro.start_z
     S["p_end_x"] = pro.end_x
     S["p_end_y"] = pro.end_y
     S["p_end_z"] = pro.end_z
     S["p_dir_x"] = pro.dir_x
     S["p_dir_y"] = pro.dir_y
     S["p_dir_z"] = pro.dir_z
+    S["p_dist_to_vertex"] = pro.dist_start  # legacy GUMP name
     S["p_trackScore"] = pro.trackScore
+    S["p_track_score"] = pro.trackScore  # legacy GUMP alias
     S["mu_chi2_of_lead_prot"] = pro.chi2u_cafpyana
     S["prot_chi2_of_lead_prot"] = pro.chi2p_cafpyana
+
+    # leading-proton-candidate truth (truth of the reco track matched to the
+    # leading proton cand); GUMP kept both p_true_* and true_pcand_* names
+    p_true_p = magdf(pd.DataFrame({"x": pro.true_genp_x, "y": pro.true_genp_y, "z": pro.true_genp_z}))
+    S["p_true_p"] = p_true_p
+    S["true_pcand_p"] = p_true_p
+    S["p_true_pdg"] = pro.true_pdg
+    S["true_pcand_pdg"] = pro.true_pdg
+    S["true_pcand_dir_x"] = pro.true_genp_x / p_true_p
+    S["true_pcand_dir_y"] = pro.true_genp_y / p_true_p
+    S["true_pcand_dir_z"] = pro.true_genp_z / p_true_p
+    S["true_pcand_end_x"] = pro.true_end_x
+    S["true_pcand_end_y"] = pro.true_end_y
+    S["true_pcand_end_z"] = pro.true_end_z
+
+    # sub-leading proton length: 2nd-longest proton candidate (same is_prot_cand
+    # set as the leading proton -> no track-score gate). Sort ascending by len,
+    # then nth(-2) -> 2nd largest (legacy GUMP idiom); slices with <2 candidates
+    # drop out and become NaN after reindex. nth keeps the per-pfp index, so
+    # drop the pfp level before aligning onto the slice frame.
+    subldf = P[is_prot_cand & (P.len > 0)]
+    if len(subldf):
+        subl = subldf.sort_values("len").len.groupby(level=[0, 1]).nth(-2).droplevel(2)
+    else:
+        subl = pd.Series(dtype=float)
+    S["subl_proton_length"] = subl.reindex(S.index)
+
+    # longest other pfp: length of the longest pfp in the slice that is
+    # neither the muon candidate nor the leading-length proton candidate
+    # (ANY pfp counts here, candidate or not); NaN if no such pfp
+    excl = pd.Series(False, index=P.index)
+    if len(mu_ilocs):
+        excl.loc[pd.Index(mu_ilocs.values)] = True
+    if len(prodf):
+        excl.loc[pd.Index(p_ilocs.values)] = True
+    othr = P.len[~excl & P.len.notna()].groupby(level=[0, 1]).max()
+    S["othr_pfp_length"] = othr.reindex(S.index)
+
     S["del_p"] = del_p
     S["del_Tp"] = del_Tp
     S["del_phi"] = del_phi
@@ -686,33 +817,19 @@ def fetch_candidates(S, P, do_calo_syst):
 # Main evt builder
 # =====================================================================
 def make_maple_evt_df(f, selection="none", do_calo_syst=True):
+    # Get a slice level df (S) a pfp level df (P) and some meta-data
     S, P, DETECTOR, RUN, ismc = fetch_info(f)
 
-    # ------------------------------------------------------------------
-    # PID-free cut chain
-    # ------------------------------------------------------------------
-    S["cut_sanity"] = S.slc_vtx_x.notna() & S.slc_vtx_y.notna() & S.slc_vtx_z.notna() & S.charge_center_z.notna()
-    S["cut_fv"] = gc.slcfv_cut(S)
-    if DETECTOR == "ICARUS":
-        S["cut_crthit"] = ~S.crthit
-        slice_cryo = np.select([S.slc_vtx_x < 0, S.slc_vtx_x > 0], [0, 1], default=-1)
-        S["slice_cryo"] = slice_cryo
-        S["cut_cryo"] = (S.cryo_light != -1) & ((S.cryo_light == 2) | (slice_cryo == S.cryo_light))
-    else:
-        # SBND: CRT veto and cryo-light cuts pass trivially (see above)
-        S["cut_crthit"] = True
-        S["slice_cryo"] = -1
-        S["cut_cryo"] = True
-
+    # After df prod, limited trk info access. So cut here.
+    # Check that all tracks are contained
     valid_c = P.start_x.notna() & P.end_x.notna() & P.len.notna()
     bad_contain = valid_c & ((P.end_x * P.slc_vtx_x < 0) | ~P.contained10)
     any_bad = bad_contain.groupby(level=[0, 1]).any()
     S["cut_contained"] = ~_reindex(any_bad, S.index, False).astype(bool)
 
-    # SBND cathode-crossing veto (GUMP cathode_cut, extended to all tracks in
-    # the slice); always True on ICARUS so the cut chain is unchanged there
+    # SBND cathode-crossing veto 
     if DETECTOR == "SBND":
-        cross = gc.maple_sbnd_cathode_crossing(
+        cross = gmpl.sbnd_cathode_crossing(
             P.slc_vtx_x[valid_c], P.slc_vtx_y[valid_c], P.slc_vtx_z[valid_c],
             P.end_x[valid_c], P.end_y[valid_c], P.end_z[valid_c])
         any_cross = pd.Series(cross, index=P.index[valid_c]).groupby(level=[0, 1]).any()
@@ -720,11 +837,10 @@ def make_maple_evt_df(f, selection="none", do_calo_syst=True):
     else:
         S["cut_cathode"] = True
 
-    S["maple_presel"] = S.cut_sanity & S.cut_fv & S.cut_crthit & S.cut_cryo & \
-        S.cut_contained & S.cut_cathode
-
-    P = PID_calcs(f, P, do_calo_syst=do_calo_syst)
-
+    # Again, since we have limited trk info access after df prod
+    # we want to grab information about candidate mu and p tracks here.
+    # Start with PID calculations and then do some basic candidate ID.
+    P = PID_calcs(f, P, DETECTOR, ismc, do_calo_syst=do_calo_syst)
     S = fetch_candidates(S, P, do_calo_syst)
 
     # ------------------------------------------------------------------
@@ -739,7 +855,7 @@ def make_maple_evt_df(f, selection="none", do_calo_syst=True):
         [S.tmatch_idx < 0,
          nu_class == CLS_1MU1P,
          nu_class == CLS_1MUNP,
-         ~gc.trueslcfv_cut(S),
+         ~gmpl.prefix_fv_cut(S, "true_vtx"),
          np.abs(S.true_pdg) == 12,
          S.true_iscc == 0,
          (S.true_iscc == 1) & (S.true_genie_mode == 0),
@@ -752,13 +868,21 @@ def make_maple_evt_df(f, selection="none", do_calo_syst=True):
     # ------------------------------------------------------------------
     # assemble sBruce columns
     S["flash_maxpe"] = S.flash_maxpe
-    S["flash_maxpe_cryo0"] = S.flash_maxpe_cryo1
+    S["flash_maxpe_cryo0"] = S.flash_maxpe_cryo0
     S["flash_maxpe_cryo1"] = S.flash_maxpe_cryo1
-    chain = maple_selection(S)
+
+    chain = gmpl.maple_cut_chain(S)
+    S["cut_presel"] = chain.cut_presel
+    S["cut_cosmic"] = chain.cut_cosmic
+    S["cut_flash"] = chain.cut_flash
+    S["cut_trk"] = chain.cut_trk
     S["cut_muon"] = chain.cut_muon
     S["cut_protons"] = chain.cut_protons
+    # exclusive selections split on n_pfp: gump = base chain & n_pfp==2 (1u1p),
+    # maple = base chain & n_pfp>2 (1uN>1p). NB maple_sel used to be the
+    # inclusive base chain; 1u1p analyses must use gump_sel.
+    S["gump_sel"] = chain.gump_sel
     S["maple_sel"] = chain.maple_sel
-    S["maxcut"] = chain.maxcut
 
     # ------------------------------------------------------------------
     # selection option
@@ -766,9 +890,9 @@ def make_maple_evt_df(f, selection="none", do_calo_syst=True):
     if selection == "none":
         pass
     elif selection == "presel":
-        S = S[S.maple_presel]
+        S = S[S.cut_presel]
     elif selection == "full":
-        S = S[S.maple_sel]
+        S = S[S.gump_sel | S.maple_sel]
     else:
         raise ValueError("selection must be 'none', 'presel', or 'full'")
 
@@ -781,6 +905,17 @@ def make_maple_evt_nosel_df(f):
 
 def make_maple_evt_presel_df(f):
     return make_maple_evt_df(f, selection="presel", do_calo_syst=True)
+
+# non-CV / detector-variation MC: preselection only, calo variations skipped
+# (those are only needed for the CV reweighting envelope, and computing them
+# substantially slows down processing).
+def make_maple_evt_presel_nocalo_df(f):
+    return make_maple_evt_df(f, selection="presel", do_calo_syst=False)
+
+# data: preselection only, no truth (mcnu built separately/omitted) and no calo
+# variations.
+def make_maple_evt_presel_data_df(f):
+    return make_maple_evt_df(f, selection="presel", do_calo_syst=False)
 
 def make_maple_evt_fullsel_df(f):
     return make_maple_evt_df(f, selection="full", do_calo_syst=True)
@@ -834,7 +969,7 @@ def make_maple_nudf(f):
     })
     nudf["is_sig"] = (cls.maple_class == CLS_1MU1P) | (cls.maple_class == CLS_1MUNP)
     nudf["is_other_numucc"] = cls.maple_class == CLS_1MUNP
-    nudf["is_fv"] = gc.posfv_cut(nudf)
+    nudf["is_fv"] = gmpl.prefix_fv_cut(nudf, "pos")
     nudf["ind"] = nudf.index.get_level_values(1)
     nudf["detector"] = DETECTOR
     nudf["Run"] = RUN
