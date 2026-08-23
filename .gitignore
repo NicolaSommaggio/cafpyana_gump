@@ -18,3 +18,4 @@ envs/logs/
 *__init__.py
 *jupyterhub.sqlite
 jupyterhub_cookie_secret
+analysis_village/gump/envs
