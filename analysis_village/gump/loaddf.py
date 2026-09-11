@@ -14,10 +14,14 @@ import pyanalib.pandas_helpers as ph
 from multiprocess import Pool
 from functools import partial
 import syst
-import rwt_map as rw
 
+# rwt_map and gumple_cuts live in analysis_village/gumple/. The cwd-relative
+# entry is kept for compatibility with running from analysis_village/gump; the
+# file-relative one makes the import work regardless of cwd.
 workspace_root = os.getcwd()
 sys.path.insert(0, workspace_root + "/../gumple/")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gumple"))
+import rwt_map as rw
 import gumple_cuts as gmpl
 
 def tmatch(reco, mc):
@@ -196,9 +200,9 @@ truthvars = {
   "true_isothernumucc": ("is_other_numucc", ""),
   "true_isfv": ("is_fv", ""),
   "genie_mode": ("genie_mode", ""),
-  "true_vtx_x": ("pos_x", ""),
-  "true_vtx_y": ("pos_y", ""),
-  "true_vtx_z": ("pos_z", ""),
+  "true_pos_x": ("pos_x", ""),# we were already getting something called true_vtx_x from recodf
+  "true_pos_y": ("pos_y", ""),# this was causing *_x, *_y to get appended to columns.
+  "true_pos_z": ("pos_z", ""),
   "true_nmu": ("nmu", ""),
   "true_np": ("np", ""),
   "true_nn": ("nn", ""),
@@ -249,9 +253,13 @@ def genie_fsi_name(code):
     return GENIE_FSI_NAMES.get(int(code), "code%d" % int(code))
 
 # pre-FSI hadron species: output moniker -> pdg selection. Monikers follow the
-# make_mcdf convention (mu/p/p2/cpi/e). The photon is NOT here -- see below.
+# make_mcdf convention (mu/p/p2/cpi/e), extended with n/n2 for the neutron, which has
+# no make_mcdf counterpart. The photon is NOT here -- see below. NB the neutron IS
+# transported by INTRANUKE, so unlike the photon it carries a real fate: its status is
+# 14 and its fsi is FSI_NOINT/CEX/ELAS/INELAS/..., never FSI_NONE.
 _PREFSI_PDG = {
     "p":   lambda pdg: pdg == 2212,
+    "n":   lambda pdg: pdg == 2112,
     "cpi": lambda pdg: np.abs(pdg) == 211,
     "pi0": lambda pdg: pdg == 111,
 }
@@ -269,8 +277,8 @@ _PREFSI_PDG = {
 _PREFSI_GAMMA_MOTHER = [3, 12, 14]
 
 # species carrying a momentum, in output order. "lep" is the primary lepton and
-# "p2" the sub-leading pre-FSI proton; both are handled specially below.
-_GENIE_SPECIES = ["lep", "p", "p2", "cpi", "g", "pi0"]
+# "p2"/"n2" the sub-leading pre-FSI proton and neutron; all are handled specially below.
+_GENIE_SPECIES = ["lep", "p", "p2", "n", "n2", "cpi", "g", "pi0"]
 
 _GENIE_SCALARS = ["genie_Enu", "genie_q0", "genie_q3", "genie_W",
                   "genie_pmiss", "genie_emiss"]
@@ -410,6 +418,10 @@ def _evtrec_kinematics(er, mcdf):
     sp = pre[pre.pdg == 2212]
     sp = sp.groupby(level=[0, 1]).head(2)
     parts["p2"] = sp[sp.groupby(level=[0, 1]).cumcount() == 1].droplevel("pindex")
+    # sub-leading neutron: the same, on the momentum-ordered neutron list
+    sn = pre[pre.pdg == 2112]
+    sn = sn.groupby(level=[0, 1]).head(2)
+    parts["n2"] = sn[sn.groupby(level=[0, 1]).cumcount() == 1].droplevel("pindex")
 
     # photons: status-1, but only those from a primary-vertex parent (see above)
     gam = er[er.pdg == 22]
@@ -625,9 +637,10 @@ BE_SHIFT = 0.025
 # BE systematic (eres_ar23_ar25.BE_FRACTION, mcdata_comparison)
 BE_FRACTION = 0.5
 
-# Columns syst.split_tracks recomputes on the plane-crossing rows
+# Columns syst.split_tracks recomputes on the plane-crossing rows. mu_T is no
+# longer stored in the GUMPLE dfs (recompute as mu_E - MUON_MASS if needed).
 _SPLIT_COLS = ["mu_end_x", "mu_end_y", "mu_end_z", "mu_len",
-               "nu_E_calo", "del_p", "del_Tp", "del_phi", "mu_E", "mu_T"]
+               "nu_E_calo", "del_p", "del_Tp", "del_phi", "mu_E"]
 
 def _weight_col(df):
     """The column the mixture weight is folded into.
@@ -645,8 +658,9 @@ def _mix(df, varied, rows, frac):
     The affected rows enter twice -- unvaried at (1-f)*w and varied at f*w --
     and every other row is left alone, so histogramming the result with the
     weight column reproduces (1-f)*nominal + f*varied exactly, with no added MC
-    statistical noise. Same convention as syst.TrackSplittingSystematic and
-    syst.shift_binding_energy(fraction=...).
+    statistical noise. Same convention as syst.TrackSplittingSystematic.
+    (syst.shift_binding_energy instead shifts a deterministic fraction of the
+    rows in place, keeping the row count.)
 
     `rows` is positional (index labels are not guaranteed unique), and `varied`
     holds exactly those rows, already carrying their unscaled weights.
@@ -675,12 +689,14 @@ def _apply_variations(df, shift_binding_E, split_tracks,
     split_fraction / shift_fraction to override; 1.0 varies every affected event
     in place, as before the fractions existed.
 
-    With a fraction below 1 the returned frame therefore has MORE ROWS than the
-    input and duplicate index labels, though the total weight is unchanged: the
-    split adds a copy of the crossing rows, the BE shift a copy of every row (it
-    goes through syst.shift_binding_energy's own mixture -- see below). Cut
-    columns must be evaluated downstream of this (loaddf computes none itself):
-    the split moves mu_end_*, which the FV cuts read.
+    With a split fraction below 1 the returned frame has MORE ROWS than the
+    input and duplicate index labels (the split adds a copy of the crossing
+    rows via _mix), though the total weight is unchanged. The BE shift keeps
+    the row count: syst.shift_binding_energy recomputes the shifted kinematics
+    in place on a deterministic, evenly-interleaved fraction of the rows and
+    leaves the rest at their stored CV values. Cut columns must be evaluated
+    downstream of this (loaddf computes none itself): the split moves
+    mu_end_*, which the FV cuts read.
 
     Run after the cache read/write on purpose: the cache always holds the
     unvaried df, so one cached load serves every variant and adding a variation
@@ -701,13 +717,11 @@ def _apply_variations(df, shift_binding_E, split_tracks,
             df = _mix(df, s, rows, f)
     if shift_binding_E:
         f = BE_FRACTION if shift_fraction is None else shift_fraction
-        # hand off to shift_binding_energy's own mixture rather than mixing the
-        # stored CV rows in here with _mix: its unshifted half is *rebuilt* by
-        # recompute_kinematics, and that recompute does not reproduce the stored
-        # CV columns exactly (~5 MeV in nu_E_calo, more in del_p/del_phi), so
-        # mixing against the stored CV would give a different universe than the
-        # signal-box systematic. Costs a whole-frame copy, which is why the
-        # caller should slim the frame first if memory is tight.
+        # hand off to shift_binding_energy so this stays the same universe as
+        # the signal-box systematic: it shifts a deterministic fraction f of
+        # the rows in place (unshifted rows keep their stored CV columns; row
+        # count and weights unchanged). Costs a whole-frame copy, which is why
+        # the caller should slim the frame first if memory is tight.
         df = syst.shift_binding_energy(df, BE_SHIFT, fraction=f, scale=_weight_col(df))
     return df
 
@@ -861,6 +875,7 @@ def load_one(fname, idf,
     if n_dup_rows > 0:
         pot *= 1. - n_dup_rows / len(hdr)
 
+
     # LOAD TRUTH
     if load_truth:
         mcdf = pd.read_hdf(fname, mcname % idf)
@@ -953,6 +968,7 @@ def load_one(fname, idf,
     if not include_syst:
         if cache_dir is not None:
             _write_cache(cache_file, df, match, pot)
+        df["total_pot"] = pot
         return _apply_variations(df, shift_binding_E, split_tracks, shift_fraction, split_fraction), match, pot
 
     # LOAD WEIGHTS
@@ -1208,6 +1224,7 @@ def load_one(fname, idf,
     if cache_dir is not None:
         _write_cache(cache_file, mrg, match, pot)
 
+    mrg["total_pot"] = pot
     return _apply_variations(mrg, shift_binding_E, split_tracks, shift_fraction, split_fraction), match, pot
 
 
@@ -1227,6 +1244,7 @@ def load(fname, maxdf=None, **kwargs):
         dfs.append(df)
         matches.append(match)
     df = pd.concat(dfs).reset_index(drop=True)
+
     match = pd.concat(matches)
     n_match_before = len(match)
 
@@ -1259,6 +1277,7 @@ def load(fname, maxdf=None, **kwargs):
               f"{n_dup_pairs} duplicated {tuple(dedup_levels)} keys "
               f"({n_dup_rows} match rows)")
 
+    df["total_pot"] = pots
     return df, match, pots
     
 def loadl(flist, progress=True, njob=None, **kwargs):
@@ -1284,12 +1303,14 @@ def loadl(flist, progress=True, njob=None, **kwargs):
         dfs.append(df)
         matches.append(match)
     df = pd.concat(dfs, ignore_index=True)
+
     del dfs
     matches = pd.concat(matches)
 
     if njob is not None:
         pool.close()
 
+    df["total_pot"] = pots
     return df, matches, pots
 
 def match_common_evts(mrgs, dfs, pots):
